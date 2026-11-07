@@ -1,0 +1,90 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-docforensiq}
+      POSTGRES_USER: ${POSTGRES_USER:-docforensiq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-only-change-me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - docforensiq-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-docforensiq} -d ${POSTGRES_DB:-docforensiq}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build:
+      context: ./backend
+    env_file:
+      - ./backend/.env
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-docforensiq}:${POSTGRES_PASSWORD:-local-development-only-change-me}@db:5432/${POSTGRES_DB:-docforensiq}
+      JWT_SECRET: ${JWT_SECRET:-development-secret-not-for-production-please-change}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+      SELF_REGISTRATION_ENABLED: ${SELF_REGISTRATION_ENABLED:-true}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_NAME: ${ADMIN_NAME:-DocForensIQ Admin}
+      EMAIL_SINK_FILE: /app/mailbox/.dev-mailbox.jsonl
+      DOCUMENT_STORAGE_PATH: /app/private_uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - docforensiq-mailbox:/app/mailbox
+      - docforensiq-documents:/app/private_uploads
+  ocr-worker:
+    build:
+      context: ..
+      dockerfile: DataOps/backend/Dockerfile.ocr-worker
+    env_file:
+      - ./backend/.env
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-docforensiq}:${POSTGRES_PASSWORD:-local-development-only-change-me}@db:5432/${POSTGRES_DB:-docforensiq}
+      DOCUMENT_STORAGE_PATH: /app/private_uploads
+      PADDLEOCR_PROJECT_PATH: /opt/ocr-evaluation
+      PADDLEOCR_PYTHON: /opt/paddle-venv/bin/python
+      PADDLE_PDX_CACHE_HOME: /root/.paddlex
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - docforensiq-documents:/app/private_uploads
+      - docforensiq-paddle-models:/root/.paddlex
+  frontend:
+    image: node:22-alpine
+    working_dir: /workspace
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+      VITE_SELF_REGISTRATION_ENABLED: ${SELF_REGISTRATION_ENABLED:-true}
+      VITE_USE_MOCK_API: "false"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/DocForensIQ-frontend:/workspace
+      - docforensiq-node-modules:/workspace/node_modules
+    depends_on:
+      - api
+volumes:
+  docforensiq-postgres:
+  docforensiq-node-modules:
+  docforensiq-mailbox:
+  docforensiq-documents:
+  docforensiq-paddle-models:
