@@ -50,6 +50,80 @@ flowchart TD
     K --> L
 ```
 
+## Quick start (verified repository commands)
+
+Choose one startup mode. Do not start the local launcher and Docker stack at the same time; both use the same default ports.
+
+### Windows local launcher
+
+Prerequisites: Windows PowerShell, Node.js/npm, `uv`, and the separate PaddleOCR evaluation environment at `../extra_things/PaddleOcr/ocr_evaluation` (or set `PADDLEOCR_PYTHON` in `backend/.env` to its Python executable).
+
+From the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\\run-local.ps1
+```
+
+The script creates missing local env files from examples, syncs backend dependencies, applies Alembic migrations, checks the PaddleOCR runner, and starts the API, OCR worker, and Vite frontend. It opens the frontend at `http://localhost:5173`; API docs are at `http://localhost:8000/docs`. Logs are written to `logs/`. Press `Ctrl+C` in the launcher terminal to stop its child processes.
+
+### Docker Compose
+
+From the repository root, configure the root Compose environment and backend environment before starting:
+
+```powershell
+Copy-Item .env.example .env
+Copy-Item backend/.env.example backend/.env
+docker compose up -d --build
+```
+
+Open `http://localhost:5173`; API docs: `http://localhost:8000/docs`. Follow logs with `docker compose logs -f api ocr-worker`; stop containers with `docker compose down`. This preserves named volumes. Do not use `docker compose down -v` unless you intentionally want to delete the development database and persisted evidence volumes.
+
+To provision an administrator, set unique `ADMIN_EMAIL` and `ADMIN_PASSWORD` values in the project-root `.env`, then run:
+
+```powershell
+docker compose exec api python -m scripts.seed_admin
+```
+
+### Run API and frontend separately
+
+Backend (Python 3.12, from the repository root):
+
+```powershell
+cd backend
+py -m pip install uv
+uv sync --python 3.12 --extra test --locked
+Copy-Item .env.example .env
+uv run alembic upgrade head
+uv run uvicorn app.main:app --reload
+```
+
+In a second terminal, start the isolated OCR worker using the configured PaddleOCR runtime (the launcher is the recommended local orchestration path). In a third terminal, start the frontend:
+
+```powershell
+cd frontend\\DocForensIQ-frontend
+Copy-Item .env.example .env.local
+npm ci
+npm run dev
+```
+
+The direct backend defaults to SQLite unless `DATABASE_URL` is changed. The API does not create tables automatically: always run `uv run alembic upgrade head` after configuring the database.
+
+### Configuration and optional provider
+
+Use the root `.env.example` for Docker Compose settings, `backend/.env.example` for API/worker settings, and `frontend/DocForensIQ-frontend/.env.example` for Vite settings. Copy them to the corresponding local filenames above; never commit real `.env` files. Relationship extraction is optional and disabled unless `RELATIONSHIP_EXTRACTION_ENABLED=true` is set in the backend environment with a valid provider configuration. The provider key must remain server-side and must never be placed in a `VITE_*` variable. The PaddleOCR runtime is separate from this relationship-extraction provider.
+
+### First investigation workflow
+
+1. Start the services and sign in (or provision the admin in Docker mode as described above).
+2. Create an investigation from the workspace.
+3. Upload PDF, JPEG, PNG, or TIFF evidence (maximum 25 MiB per upload).
+4. Watch the document processing status; open the document review to inspect OCR output when complete.
+5. Inspect the entity/relationship results and their source references. Optional provider-backed extraction requires its backend configuration; deterministic identifier-based candidates may still be available.
+6. Review findings, timeline, and evidence search results. Open citations against the originating document and page.
+7. Create a dossier snapshot and inspect its HTML/JSON output; verify the audit chain from the audit area.
+
+Feature availability and automated-vs-manual analysis boundaries are described in [Current limitations](#current-limitations). Findings and candidate links are investigative leads and must be checked against original evidence.
+
 ## Architecture
 
 ```text
