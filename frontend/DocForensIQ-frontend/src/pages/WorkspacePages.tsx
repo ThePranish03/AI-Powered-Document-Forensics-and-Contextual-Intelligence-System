@@ -9,6 +9,8 @@ import RelationshipExplorer, { type RelationshipClaim, type RelationshipDocument
 import EvidenceGraphView from '../features/relationships/EvidenceGraphView';
 import type { ApiGraphEdge, ApiGraphNode } from '../features/relationships/graphAdapter';
 import InvestigationAnalysis, { type AnalysisSection } from '../features/investigation/InvestigationAnalysis';
+import { InvestigationClassification, InvestigationExtractedData, InvestigationOverview } from '../features/investigation/InvestigationSections';
+import InvestigationEvidenceViewer from '../features/investigation/InvestigationEvidenceViewer';
 
 interface Summary { total_investigations: number; active_investigations: number; in_review_investigations: number; completed_investigations: number }
 interface Investigation { id: string; case_number: string; title: string; status: string; document_count: number; updated_at: string }
@@ -48,6 +50,7 @@ export function WorkspaceLayout({ children }: { children?: ReactNode }) {
   const initials = user?.full_name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || 'DF';
   const currentPage = location.pathname.split('/').filter(Boolean).at(-1) || 'workspace';
   const pageLabels: Record<string, string> = {
+    overview: 'Investigation overview',
     new: 'New investigation',
     processing: 'Processing',
     classification: 'Classification',
@@ -66,7 +69,7 @@ export function WorkspaceLayout({ children }: { children?: ReactNode }) {
     workspace: 'Overview',
   };
   const pageTitle = activeInvestigationId && currentPage === activeInvestigationId
-    ? 'Overview' : pageLabels[currentPage] ?? currentPage.replaceAll('-', ' ');
+    ? 'Documents' : pageLabels[currentPage] ?? currentPage.replaceAll('-', ' ');
   const currentCaseTitle = activeInvestigation?.title || activeInvestigation?.case_number || activeInvestigationId;
   const workspaceLinks = [
     { label: 'Home', to: '/', icon: Home, end: true },
@@ -75,7 +78,8 @@ export function WorkspaceLayout({ children }: { children?: ReactNode }) {
     { label: 'Reports', to: investigationPath ? `${investigationPath}/dossier` : '/investigations', icon: FileText, end: true },
   ];
   const investigationLinks = investigationPath ? [
-    { label: 'Overview', to: investigationPath, icon: Layers3, end: true },
+    { label: 'Overview', to: `${investigationPath}/overview`, icon: Layers3, end: true },
+    { label: 'Documents', to: investigationPath, icon: FileText, end: true },
     { label: 'Processing', to: `${investigationPath}/processing`, icon: Activity },
     { label: 'Classification', to: `${investigationPath}/classification`, icon: FileCheck2 },
     { label: 'Structure & Visual Forensics', to: `${investigationPath}/visual`, icon: FileImage },
@@ -338,7 +342,11 @@ const ANALYSIS_SECTIONS = ['correlation', 'findings', 'timeline', 'visual', 'sea
 
 function CaseNav({ investigationId, current }: { investigationId: string; current: string }) {
   const links: Array<[string, string]> = [
+    ['Overview', 'overview'],
     ['Documents', ''],
+    ['Classification', 'classification'],
+    ['Extracted data', 'extracted-data'],
+    ['Evidence viewer', 'evidence'],
     ['Relationships', 'relationships'],
     ['Cross-document', 'correlation'],
     ['Findings', 'findings'],
@@ -539,6 +547,30 @@ export function InvestigationUnavailable() {
       <div className="dashboard-welcome"><div><div className="eyebrow"><FileText size={13}/> {investigation.data?.case_number || 'INVESTIGATION'}</div><h1>{investigation.data?.title || 'Investigation'}</h1><p>Evidence-backed review. Automated results stay candidates until you record a disposition.</p></div></div>
       <CaseNav investigationId={investigationId} current={analysisSection}/>
       <InvestigationAnalysis investigationId={investigationId} section={analysisSection}/>
+    </section>;
+  }
+
+  if (section === 'overview') {
+    return <section className="dashboard-page">
+      <div className="dashboard-welcome"><div><div className="eyebrow"><Layers3 size={13}/> INVESTIGATION SUMMARY</div><h1>{investigation.data?.title || 'Investigation overview'}</h1><p>{investigation.data?.case_number || ''} · Case status and persisted evidence coverage</p></div></div>
+      <CaseNav investigationId={investigationId} current="overview"/>
+      <InvestigationOverview investigationId={investigationId}/>
+    </section>;
+  }
+  if (section === 'classification' || section === 'extracted-data') {
+    return <section className="dashboard-page">
+      <div className="dashboard-welcome"><div><div className="eyebrow"><FileCheck2 size={13}/> INVESTIGATION EVIDENCE</div><h1>{section === 'classification' ? 'Classification' : 'Extracted data'}</h1><p>{investigation.data?.case_number || ''} · {investigation.data?.title || 'Investigation'}</p></div></div>
+      <CaseNav investigationId={investigationId} current={section}/>
+      {documents.isLoading ? <LoadingPanel/> : documents.isError ? <QueryError onRetry={() => void documents.refetch()}/> : section === 'classification'
+        ? <InvestigationClassification investigationId={investigationId} documents={documentItems}/>
+        : <InvestigationExtractedData investigationId={investigationId} documents={documentItems}/>}
+    </section>;
+  }
+  if (section === 'evidence') {
+    return <section className="dashboard-page">
+      <div className="dashboard-welcome"><div><div className="eyebrow"><FileImage size={13}/> SOURCE EVIDENCE</div><h1>Evidence viewer</h1><p>{investigation.data?.case_number || ''} · {investigation.data?.title || 'Investigation'} · Source documents, OCR blocks, and visual observations</p></div></div>
+      <CaseNav investigationId={investigationId} current="evidence"/>
+      {documents.isLoading ? <LoadingPanel/> : documents.isError ? <QueryError onRetry={() => void documents.refetch()}/> : <InvestigationEvidenceViewer investigationId={investigationId} documents={documentItems}/>}
     </section>;
   }
 
