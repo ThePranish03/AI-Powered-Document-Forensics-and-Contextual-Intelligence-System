@@ -10,10 +10,109 @@
 
 [Repository](https://github.com/ThePranish03/AI-Powered-Document-Forensics-and-Contextual-Intelligence-System) · [Frontend (local)](http://localhost:5173) · [API (local)](http://localhost:8000) · [API docs (development)](http://localhost:8000/docs)
 
+## Run the application locally
+
+### Prerequisites
+
+- Windows PowerShell for the documented launcher commands.
+- Node.js/npm for the frontend.
+- Python 3.12 and `uv` for the backend.
+- Docker Desktop and a Docker Compose version supporting named additional build contexts if using containers.
+- The sibling PaddleOCR evaluation/runtime project required by the OCR worker setup.
+- Environment files configured from the supplied examples.
+
+### Option A — Windows one-command launcher
+
+From the project root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run-local.ps1
+```
+
+The repository README documents this launcher as applying backend migrations, starting the API and OCR worker, starting Vite, opening the frontend, and writing service logs under `logs/`. Press `Ctrl+C` in the launcher terminal to stop the services.
+
+The PaddleOCR environment is expected at:
+
+```text
+../extra_things/PaddleOcr/ocr_evaluation
+```
+
+Configure `PADDLEOCR_PYTHON` in `backend/.env` if the worker's Python executable is elsewhere.
+
+### Option B — Docker Compose
+
+From the repository root:
+
+```powershell
+Copy-Item .env.example .env
+Copy-Item backend/.env.example backend/.env
+docker compose up -d --build
+```
+
+The OCR worker build uses the sibling `../extra_things/PaddleOcr/ocr_evaluation` directory as a named build context. Keep that project available beside this repository.
+
+View logs:
+
+```powershell
+docker compose logs -f api ocr-worker
+```
+
+Stop services:
+
+```powershell
+docker compose down
+```
+
+To provision an administrator, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in the **project-root** `.env`, then run:
+
+```powershell
+docker compose exec api python -m scripts.seed_admin
+```
+
+Use a unique password of at least 12 characters. Keep credentials private.
+
+### Option C — Run API and frontend separately
+
+**Backend (Python 3.12):**
+
+```powershell
+cd backend
+py -m pip install uv
+uv sync --python 3.12 --extra test --locked
+Copy-Item .env.example .env
+uv run alembic upgrade head
+uv run uvicorn app.main:app --reload
+```
+
+**Frontend (separate terminal):**
+
+```powershell
+cd frontend\DocForensIQ-frontend
+Copy-Item .env.example .env.local
+npm ci
+npm run dev
+```
+
+Configure the frontend API URL and registration/demo settings in `.env.local`. SQLite is the direct local-development default; PostgreSQL can be selected through `DATABASE_URL`.
+
+**Important:** Apply Alembic migrations before starting the API. The API does not create database tables automatically.
+
+### Local service URLs
+
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:5173 |
+| Backend | http://localhost:8000 |
+| Health check | http://localhost:8000/health |
+| API docs (development) | http://localhost:8000/docs |
+
+---
+
 ---
 
 ## Table of contents
 
+1. [Run the application locally](#run-the-application-locally)
 1. [Project overview](#1-project-overview)
 2. [Problem statement](#2-problem-statement)
 3. [Objectives and novelty](#3-objectives-and-novelty)
@@ -32,7 +131,6 @@
 16. [LLM integration and responsible AI](#16-llm-integration-and-responsible-ai)
 17. [Security, privacy and audit](#17-security-privacy-and-audit)
 18. [Repository structure](#18-repository-structure)
-19. [Run the application locally](#19-run-the-application-locally)
 20. [Configuration](#20-configuration)
 21. [Testing and evaluation](#21-testing-and-evaluation)
 22. [Current limitations and implementation boundaries](#22-current-limitations-and-implementation-boundaries)
@@ -718,104 +816,6 @@ DocForensIQ/
 ```
 
 The tree above is a high-level guide; exact filenames and feature-module organization can evolve. The OCR evaluation project is maintained as a sibling build context at `../extra_things/PaddleOcr/ocr_evaluation` for the documented local/Docker workflow.
-
----
-
-## 19. Run the application locally
-
-### Prerequisites
-
-- Windows PowerShell for the documented launcher commands.
-- Node.js/npm for the frontend.
-- Python 3.12 and `uv` for the backend.
-- Docker Desktop and a Docker Compose version supporting named additional build contexts if using containers.
-- The sibling PaddleOCR evaluation/runtime project required by the OCR worker setup.
-- Environment files configured from the supplied examples.
-
-### Option A — Windows one-command launcher
-
-From the project root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run-local.ps1
-```
-
-The repository README documents this launcher as applying backend migrations, starting the API and OCR worker, starting Vite, opening the frontend, and writing service logs under `logs/`. Press `Ctrl+C` in the launcher terminal to stop the services.
-
-The PaddleOCR environment is expected at:
-
-```text
-../extra_things/PaddleOcr/ocr_evaluation
-```
-
-Configure `PADDLEOCR_PYTHON` in `backend/.env` if the worker's Python executable is elsewhere.
-
-### Option B — Docker Compose
-
-From the repository root:
-
-```powershell
-Copy-Item .env.example .env
-Copy-Item backend/.env.example backend/.env
-docker compose up -d --build
-```
-
-The OCR worker build uses the sibling `../extra_things/PaddleOcr/ocr_evaluation` directory as a named build context. Keep that project available beside this repository.
-
-View logs:
-
-```powershell
-docker compose logs -f api ocr-worker
-```
-
-Stop services:
-
-```powershell
-docker compose down
-```
-
-To provision an administrator, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in the **project-root** `.env`, then run:
-
-```powershell
-docker compose exec api python -m scripts.seed_admin
-```
-
-Use a unique password of at least 12 characters. Keep credentials private.
-
-### Option C — Run API and frontend separately
-
-**Backend (Python 3.12):**
-
-```powershell
-cd backend
-py -m pip install uv
-uv sync --python 3.12 --extra test --locked
-Copy-Item .env.example .env
-uv run alembic upgrade head
-uv run uvicorn app.main:app --reload
-```
-
-**Frontend (separate terminal):**
-
-```powershell
-cd frontend\DocForensIQ-frontend
-Copy-Item .env.example .env.local
-npm ci
-npm run dev
-```
-
-Configure the frontend API URL and registration/demo settings in `.env.local`. SQLite is the direct local-development default; PostgreSQL can be selected through `DATABASE_URL`.
-
-**Important:** Apply Alembic migrations before starting the API. The API does not create database tables automatically.
-
-### Local service URLs
-
-| Service | URL |
-|---|---|
-| Frontend | http://localhost:5173 |
-| Backend | http://localhost:8000 |
-| Health check | http://localhost:8000/health |
-| API docs (development) | http://localhost:8000/docs |
 
 ---
 
