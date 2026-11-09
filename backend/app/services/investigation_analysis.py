@@ -13,7 +13,7 @@ from app.models.entities import (
 )
 from app.services.audit_chain import append_audit
 from app.services.dossier_report import build_snapshot, render_html
-from app.services.ocr_metrics import analyze_documents
+from app.services.ocr_metrics import analyze_documents, build_cross_document_correlation
 
 ANALYZER_NAME = "deterministic_evidence"
 ANALYZER_VERSION = "1"
@@ -121,17 +121,33 @@ async def run_investigation_analysis(db: AsyncSession, investigation, actor_id: 
             confidence=item["confidence"],
             evidence_refs=item["evidence_refs"],
         ))
-    await db.execute(delete(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation.id))
+    existing_nodes = {
+        item.canonical_id: item
+        for item in (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation.id))).all()
+    }
+    current_node_ids = {node["canonical_id"] for node in produced["nodes"]}
+    for canonical_id, item in existing_nodes.items():
+        if canonical_id not in current_node_ids and item.review_status == "candidate":
+            await db.delete(item)
     for node in produced["nodes"]:
-        db.add(DerivedGraphNode(
-            investigation_id=investigation.id,
-            canonical_id=node["canonical_id"],
-            label=node["label"],
-            entity_type=node["entity_type"],
-            document_ids=list(dict.fromkeys(node["document_ids"])),
-            resolution=node["resolution"],
-            basis=node["basis"],
-        ))
+        item = existing_nodes.get(node["canonical_id"])
+        if item is None:
+            item = DerivedGraphNode(
+                investigation_id=investigation.id,
+                canonical_id=node["canonical_id"],
+                label=node["label"],
+                entity_type=node["entity_type"],
+                document_ids=list(dict.fromkeys(node["document_ids"])),
+                resolution=node["resolution"],
+                basis=node["basis"],
+            )
+            db.add(item)
+        else:
+            item.label = node["label"]
+            item.entity_type = node["entity_type"]
+            item.document_ids = list(dict.fromkeys(node["document_ids"]))
+            item.resolution = node["resolution"]
+            item.basis = node["basis"]
     await append_audit(
         db,
         investigation_id=investigation.id,
@@ -161,11 +177,34 @@ async def run_investigation_analysis(db: AsyncSession, investigation, actor_id: 
 
 
 async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> DossierSnapshot:
-    documents = (await db.scalars(select(Document).where(Document.investigation_id == investigation.id))).all()
+    document_rows = (await db.execute(
+        select(Document, OCRResult)
+        .outerjoin(OCRResult, OCRResult.document_id == Document.id)
+        .where(Document.investigation_id == investigation.id)
+        .order_by(Document.created_at, Document.id)
+    )).all()
+    documents = [document for document, _result in document_rows]
     findings = (await db.scalars(select(Finding).where(Finding.investigation_id == investigation.id))).all()
     timeline = (await db.scalars(select(TimelineEvent).where(TimelineEvent.investigation_id == investigation.id))).all()
     nodes = (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation.id))).all()
     version = (await db.scalar(select(func.max(DossierSnapshot.version)).where(DossierSnapshot.investigation_id == investigation.id)) or 0) + 1
+    correlation = build_cross_document_correlation([{
+        "document_id": str(document.id),
+        "filename": document.filename,
+        "sha256": document.sha256,
+        "provider": result.provider if result else None,
+        "provider_version": result.provider_version if result else None,
+        "blocks": result.blocks if result else [],
+        "text": result.recognized_text if result else "",
+        "processing_status": document.processing_status,
+    } for document, result in document_rows])
+    nodes_by_id = {item.canonical_id: item for item in nodes}
+    for link in correlation["links"]:
+        reviewed = nodes_by_id.get(link["id"])
+        if reviewed:
+            link["review_status"] = reviewed.review_status
+            link["review_reason"] = reviewed.review_reason
+            link["reviewed_at"] = reviewed.reviewed_at.isoformat() if reviewed.reviewed_at else None
     snapshot = build_snapshot(
         investigation={
             "id": str(investigation.id),
@@ -191,7 +230,12 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
             "document_ids": item.document_ids,
             "resolution": item.resolution,
             "basis": item.basis,
+            "review_status": item.review_status,
+            "review_reason": item.review_reason,
+            "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else None,
         } for item in nodes],
+        correlations=correlation["links"],
+        discrepancies=correlation["contradictions"],
     )
     record = DossierSnapshot(
         investigation_id=investigation.id,

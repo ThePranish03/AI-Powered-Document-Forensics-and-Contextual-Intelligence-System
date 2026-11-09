@@ -47,8 +47,10 @@ services:
       - docforensiq-documents:/app/private_uploads
   ocr-worker:
     build:
-      context: ..
-      dockerfile: DataOps/backend/Dockerfile.ocr-worker
+      context: .
+      dockerfile: backend/Dockerfile.ocr-worker
+      additional_contexts:
+        ocr-evaluation: ../extra_things/PaddleOcr/ocr_evaluation
     env_file:
       - ./backend/.env
     environment:

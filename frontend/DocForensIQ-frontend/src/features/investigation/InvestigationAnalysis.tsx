@@ -1,10 +1,10 @@
 import { useMemo, useState, type FormEvent } from 'react';
-import { ArrowRight, Check, Clock3, Download, Eye, FileImage, FileSearch, Fingerprint, Search, ShieldAlert } from 'lucide-react';
+import { ArrowRight, Check, Clock3, Download, Eye, FileImage, FileSearch, Fingerprint, GitBranch, Search, ShieldAlert } from 'lucide-react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { ApiError, apiRequest } from '../../services/apiClient';
 
-export type AnalysisSection = 'findings' | 'timeline' | 'visual' | 'search' | 'dossier' | 'audit' | 'ocr-evaluation';
+export type AnalysisSection = 'correlation' | 'findings' | 'timeline' | 'visual' | 'search' | 'dossier' | 'audit' | 'ocr-evaluation';
 
 interface EvidenceRef {
   document_id?: string;
@@ -31,6 +31,16 @@ interface FindingItem {
   evidence_refs: EvidenceRef[];
   limitations: string;
   review_notes: string | null;
+}
+
+interface CorrelationResult {
+  status: string;
+  method: string;
+  summary: { documents_total: number; documents_with_ocr: number; documents_pending: number; documents_with_processing_errors: number; identifier_mentions: number; candidate_entities: number; total_links: number; candidate_links: number; confirmed_links: number; rejected_links: number; unreviewed_links: number; contradictions: number };
+  links: Array<{ id: string; relation_type: string; normalized_identifier: string; identifier_type: string; document_ids: string[]; document_count: number; rank: number; rank_kind: string; method: string; explanation: string; review_status: string; review_reason?: string | null; reviewed_at?: string | null; evidence_refs: EvidenceRef[] }>;
+  comparisons: Array<{ id: string; field: string; value: string; status: string; explanation: string; documents: Array<{ document_id: string; filename: string; total: { raw: string; evidence_ref: EvidenceRef } | null; dates: Array<{ raw: string; interpreted: string | null; ambiguous: boolean; evidence_ref: EvidenceRef }> }> }>;
+  contradictions: Array<{ id: string; title: string; description: string; method: string; evidence_refs: EvidenceRef[]; limitations: string }>;
+  limitations: string;
 }
 
 interface TimelineItem {
@@ -99,6 +109,13 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
   const [datasetName, setDatasetName] = useState('Local comparison');
   const [sampleText, setSampleText] = useState(SAMPLE_TEMPLATE);
   const [activeRun, setActiveRun] = useState<EvaluationPayload | null>(null);
+  const [correlationReason, setCorrelationReason] = useState('');
+
+  const correlation = useQuery({
+    queryKey: ['correlation', investigationId],
+    queryFn: () => apiRequest<CorrelationResult>(`/investigations/${investigationId}/correlation`),
+    enabled: section === 'correlation',
+  });
 
   const findings = useQuery({
     queryKey: ['findings', investigationId, statusFilter],
@@ -161,6 +178,34 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
     },
     onError: (reason) => setError(reason instanceof ApiError ? reason.message : 'Analysis could not be run.'),
   });
+  const runCorrelation = useMutation({
+    mutationFn: () => apiRequest<CorrelationResult>(`/investigations/${investigationId}/correlation-runs`, { method: 'POST' }),
+    onSuccess: async (result) => {
+      queryClient.setQueryData(['correlation', investigationId], result);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['findings', investigationId] }),
+        queryClient.invalidateQueries({ queryKey: ['timeline', investigationId] }),
+        queryClient.invalidateQueries({ queryKey: ['relationships', investigationId] }),
+        queryClient.invalidateQueries({ queryKey: ['audit', investigationId] }),
+      ]);
+    },
+    onError: (reason) => setError(reason instanceof ApiError ? reason.message : 'Cross-document correlation could not be run.'),
+  });
+  const reviewCorrelation = useMutation({
+    mutationFn: ({ id, status }: { id: string; status: 'confirmed' | 'rejected' }) => apiRequest<{ id: string; review_status: string; reviewed_at: string; review_reason: string }>(`/investigations/${investigationId}/correlation/${encodeURIComponent(id)}/review`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status, reason: correlationReason }),
+    }),
+    onSuccess: async () => {
+      setCorrelationReason('');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['correlation', investigationId] }),
+        queryClient.invalidateQueries({ queryKey: ['relationships', investigationId] }),
+        queryClient.invalidateQueries({ queryKey: ['audit', investigationId] }),
+      ]);
+    },
+    onError: (reason) => setError(reason instanceof ApiError ? reason.message : 'The correlation review could not be saved.'),
+  });
   const search = useMutation({
     mutationFn: () => apiRequest<{ answer: string; citations: Array<{ kind: string; document_id?: string; filename?: string; page_number?: number | null; block_id?: string | null; quoted_text?: string; finding_id?: string; title?: string; status?: string }>; llm: { used: boolean; status: string; reason: string } }>(`/investigations/${investigationId}/search`, {
       method: 'POST',
@@ -217,6 +262,33 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
 
   return <div className="dashboard-page">
     {error && <div className="auth-error" role="alert">{error}</div>}
+    {section === 'correlation' && <>
+      <div className="panel-head"><div><h2>Cross-document intelligence</h2><p>Exact labeled identifiers create candidate links. Values retain their source citations; a link is not proof that records describe one transaction or party.</p></div><button className="button primary" type="button" disabled={runCorrelation.isPending} onClick={() => runCorrelation.mutate()}><GitBranch size={14}/>{runCorrelation.isPending ? 'Re-running…' : 'Re-run correlation'}</button></div>
+      {correlation.isLoading ? <div className="panel" role="status">Loading persisted OCR evidence…</div> : correlation.isError ? <div className="panel" role="alert">Cross-document results could not be loaded. <button type="button" className="text-link" onClick={() => void correlation.refetch()}>Retry</button></div> : correlation.data && <>
+        <div className="stat-grid">
+          <article className="stat-card"><span className="stat-label">DOCUMENTS WITH OCR</span><strong>{correlation.data.summary.documents_with_ocr} / {correlation.data.summary.documents_total}</strong></article>
+          <article className="stat-card"><span className="stat-label">IDENTIFIER MENTIONS</span><strong>{correlation.data.summary.identifier_mentions}</strong></article>
+          <article className="stat-card"><span className="stat-label">CANDIDATE ENTITIES</span><strong>{correlation.data.summary.candidate_entities}</strong></article>
+          <article className="stat-card"><span className="stat-label">CONFIRMED LINKS</span><strong>{correlation.data.summary.confirmed_links}</strong></article>
+          <article className="stat-card"><span className="stat-label">UNREVIEWED LINKS</span><strong>{correlation.data.summary.unreviewed_links}</strong></article>
+          <article className="stat-card"><span className="stat-label">CONTRADICTIONS</span><strong>{correlation.data.summary.contradictions}</strong></article>
+          <article className="stat-card"><span className="stat-label">DOCUMENTS WITH ERRORS</span><strong>{correlation.data.summary.documents_with_processing_errors}</strong></article>
+        </div>
+        {correlation.data.status !== 'ready' && <div className="panel notice" role="status">{correlation.data.status === 'no_documents' ? 'Upload source documents to begin.' : 'No stored OCR text is available yet. Correlation will become available after OCR completes.'}</div>}
+        {correlation.data.summary.documents_pending > 0 && <div className="notice" role="status">{correlation.data.summary.documents_pending} document(s) are still processing. Current links include completed OCR documents; refresh this view after processing completes.</div>}
+        {correlation.data.summary.documents_with_processing_errors > 0 && <div className="notice" role="status">{correlation.data.summary.documents_with_processing_errors} document(s) have processing errors and may be absent from comparisons.</div>}
+        {correlation.data.links.length === 0 && correlation.data.status === 'ready' ? <div className="panel dashboard-empty"><GitBranch size={22}/><h2>No exact cross-document identifier matches</h2><p>Names, dates, or amounts alone do not create links. New OCR results are included automatically when this view refreshes.</p></div> : correlation.data.links.map((link) => <article className="panel" key={link.id}>
+          <div className="panel-head"><div><span className={`badge ${link.review_status === 'confirmed' ? 'green' : link.review_status === 'rejected' ? 'neutral' : 'blue'}`}>{link.review_status === 'candidate' ? 'Unreviewed candidate' : link.review_status}</span><h2>{link.normalized_identifier}</h2><p>{link.identifier_type.replaceAll('_', ' ')} · {link.document_count} documents · heuristic rank {link.rank.toFixed(2)} · {link.method}</p></div></div>
+          <p>{link.explanation}</p>
+          {link.review_reason && <p className="muted">Review note: {link.review_reason}</p>}
+          <div className="ocr-block-list">{link.evidence_refs.map((ref, index) => <article key={`${link.id}-${ref.document_id}-${index}`}><b>{ref.filename || ref.document_id}</b><small>{ref.field_type}{ref.page_number == null ? '' : ` · page ${ref.page_number}`}{ref.block_id ? ` · ${ref.block_id}` : ''}</small><p>{ref.quoted_text || 'No source snippet available.'}</p>{ref.document_id && <Link className="text-link" to={`/investigations/${investigationId}?doc=${ref.document_id}`}>Open cited document</Link>}</article>)}</div>
+          {link.review_status === 'candidate' && <><label className="auth-label">Review reason<textarea value={correlationReason} onChange={(event) => setCorrelationReason(event.target.value)} maxLength={4000} rows={2} placeholder="Record why this link should be confirmed or rejected"/></label><div className="create-actions"><button className="button secondary small" type="button" disabled={reviewCorrelation.isPending || !correlationReason.trim()} onClick={() => reviewCorrelation.mutate({ id: link.id, status: 'confirmed' })}>Confirm candidate</button><button className="button secondary small" type="button" disabled={reviewCorrelation.isPending || !correlationReason.trim()} onClick={() => reviewCorrelation.mutate({ id: link.id, status: 'rejected' })}>Reject candidate</button></div></>}
+        </article>)}
+        {correlation.data.comparisons.map((comparison) => <article className="panel" key={`comparison-${comparison.id}`}><div className="panel-head"><div><h2>Comparison · {comparison.value}</h2><p>{comparison.explanation}</p></div><span className={`badge ${comparison.status === 'value_conflict' ? 'amber' : 'blue'}`}>{comparison.status.replaceAll('_', ' ')}</span></div><div className="table-wrap"><table className="dashboard-table"><thead><tr><th>SOURCE DOCUMENT</th><th>LABELED TOTAL</th><th>DOCUMENT DATES</th></tr></thead><tbody>{comparison.documents.map((doc) => <tr key={doc.document_id}><td><Link className="text-link" to={`/investigations/${investigationId}?doc=${doc.document_id}`}>{doc.filename}</Link></td><td>{doc.total ? <>{doc.total.raw}<small>{doc.total.evidence_ref.page_number == null ? '' : ` · page ${doc.total.evidence_ref.page_number}`}</small></> : 'Not extracted'}{doc.total?.evidence_ref.block_id && <small> · {doc.total.evidence_ref.block_id}</small>}</td><td>{doc.dates.length ? doc.dates.map((date) => `${date.raw}${date.ambiguous ? ' (ambiguous)' : ''}`).join(', ') : 'Not extracted'}</td></tr>)}</tbody></table></div></article>)}
+        {correlation.data.contradictions.map((finding) => <article className="panel" key={finding.id}><div className="panel-head"><div><span className="badge amber">Candidate discrepancy</span><h2>{finding.title}</h2><p>{finding.method}</p></div></div><p>{finding.description}</p><p className="muted">{finding.limitations}</p><div className="ocr-block-list">{finding.evidence_refs.map((ref, index) => <article key={`${finding.id}-${index}`}><b>{ref.filename}</b><small>{ref.field_type}{ref.page_number == null ? '' : ` · page ${ref.page_number}`}{ref.block_id ? ` · ${ref.block_id}` : ''}</small><p>{ref.quoted_text}</p>{ref.document_id && <Link className="text-link" to={`/investigations/${investigationId}?doc=${ref.document_id}`}>Open source</Link>}</article>)}</div></article>)}
+        <p className="muted">{correlation.data.limitations} · Results use {correlation.data.method}. Candidate link counts are not confirmed identity matches.</p>
+      </>}
+    </>}
     {section === 'findings' && <>
       <div className="panel-head"><div><h2>Findings for review</h2><p>Rules create candidates. Accepting one records your review; it does not prove fraud or authenticity.</p></div><div className="head-controls"><label className="auth-label">Status<select aria-label="Filter findings by status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All</option><option value="candidate">Candidate</option><option value="accepted">Accepted</option><option value="needs_review">Needs review</option><option value="rejected">Rejected</option><option value="dismissed">Dismissed</option></select></label>{runButton}</div></div>
       {findings.isLoading ? <div className="panel" role="status">Loading findings…</div> : findings.isError ? <div className="panel" role="alert">Findings could not be loaded.</div> : visibleFindings.length === 0 ? <div className="panel dashboard-empty"><FileSearch size={22}/><h2>No findings yet</h2><p>Run evidence rules after OCR finishes. Connections and conflicts appear here only when the stored text supports them.</p>{runButton}</div> : visibleFindings.map((finding) => <article className="panel" key={finding.id}>

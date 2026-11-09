@@ -509,12 +509,18 @@ async def relationship_graph(investigation_id: UUID, db: AsyncSession = Depends(
             "kind": "entity",
             "label": item.label,
             "type": item.entity_type,
-            "status": "candidate",
+            "status": item.review_status,
             "confidence": None,
             "document_ids": [],
             "resolution": item.resolution,
-            "metadata": {"basis": item.basis},
+            "metadata": {
+                "basis": item.basis,
+                "review_status": item.review_status,
+                "review_reason": item.review_reason,
+                "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else None,
+            },
         })
+        graph_nodes[item.canonical_id]["status"] = item.review_status
         graph_nodes[item.canonical_id]["document_ids"] = node["document_ids"]
         graph_nodes[item.canonical_id]["metadata"]["basis"] = item.basis
         for document_id in item.document_ids:

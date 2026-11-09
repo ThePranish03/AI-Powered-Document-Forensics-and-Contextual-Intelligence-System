@@ -25,6 +25,7 @@
 - **Evidence intake** — upload PDF, JPEG, PNG, or TIFF documents; metadata and SHA-256 hashes are stored.
 - **OCR processing & review** — process queued documents through a dedicated PaddleOCR worker and inspect normalized OCR blocks.
 - **Entity and relationship discovery** — optional structured extraction with source block references; deterministic identifier nodes are also available.
+- **Cross-document intelligence** — investigation-scoped, exact typed identifier matching links two or more OCR documents, retains page/block citations, compares labeled totals and dates, and highlights different totals for review. Investigators can confirm or reject a candidate with a reason; decisions are stored and audited. A reviewed link is still not proof of a shared identity or transaction.
 - **Evidence-linked findings** — rule-based findings and timeline events are persisted with review notes.
 - **Integrity & audit trail** — hash-chained audit events and document hash records support traceability.
 - **Dossier snapshots** — generate HTML/JSON snapshots of an investigation.
@@ -42,12 +43,15 @@ flowchart TD
     D --> E[Queue OCR job]
     E --> F[PaddleOCR worker]
     F --> G[Review normalized OCR blocks]
-    G --> H[Entity and relationship extraction]
-    G --> I[Deterministic evidence rules]
-    H --> J[Investigation graph]
-    I --> K[Findings and timeline]
-    J --> L[Evidence search and dossier snapshot]
-    K --> L
+    G --> H[Optional relationship extraction]
+    G --> I[Deterministic cross-document correlation]
+    G --> J[Deterministic evidence rules]
+    H --> K[Investigation graph]
+    I --> L[Identifier links and cited comparisons]
+    J --> M[Findings and timeline]
+    K --> N[Evidence search and dossier snapshot]
+    L --> N
+    M --> N
 ```
 
 ## Architecture
@@ -68,7 +72,7 @@ DocForensIQ/
 
 Prerequisites: Node.js, `uv`, and the sibling PaddleOCR evaluation environment described below.
 
-From the **DataOps project root**:
+From the project root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run-local.ps1
@@ -87,6 +91,8 @@ Copy-Item .env.example .env
 Copy-Item backend/.env.example backend/.env
 docker compose up -d --build
 ```
+
+The OCR worker build uses the sibling `../extra_things/PaddleOcr/ocr_evaluation` source as a named build context. Keep that evaluation project available beside this repository; Docker Compose requires a version that supports `build.additional_contexts`. The OCR worker remains isolated from the API image.
 
 - Frontend: `http://localhost:5173`
 - API: `http://localhost:8000`
@@ -174,6 +180,8 @@ npm run build
 
 Tests cover session and password flows, authorization scoping, dashboard aggregates, frontend route/session behavior, investigation creation, uploads and hashes, PDF signature screening, and OCR block normalization.
 
+Cross-document tests cover three-document exact identifier clusters, source citations, mismatched totals, typed identifier separation, amount/date-only false matches, empty OCR, authorization scope, review persistence across reruns, dossier inclusion, and correlation audit events.
+
 ## Security & evidence handling
 
 - Login and refresh tokens use HttpOnly, SameSite=Strict cookies; CSRF checks protect authenticated state-changing requests.
@@ -190,6 +198,7 @@ Tests cover session and password flows, authorization scoping, dashboard aggrega
 - OCR is processed by a database-polled worker, not a distributed queue. Stale jobs are marked failed and documents have up to three explicit retries.
 - Supported upload formats are PDF, JPEG, PNG, and TIFF; Office files are not accepted.
 - Relationship graph results are extracted or identifier-based candidates; shared identifiers are not proof that parties are the same.
+- Cross-document correlation currently matches exact labeled invoice, purchase-order, transaction, account, and reference identifiers found by deterministic OCR text rules. Fuzzy entity resolution and general-purpose semantic matching are not implemented. Conflicting totals sharing an identifier are candidate discrepancies and require source review.
 - Findings and timeline are rule-based. Visual review is manual: automated font, copy-move, compression, and forgery checks are unavailable.
 - Evidence search returns matching OCR blocks and findings; it does not perform LLM-based grounded question answering.
 - OCR evaluation compares against user-supplied ground truth; it does not benchmark a second OCR engine or report GPU/latency metrics.

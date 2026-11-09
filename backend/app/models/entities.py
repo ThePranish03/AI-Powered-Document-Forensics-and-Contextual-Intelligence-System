@@ -244,6 +244,10 @@ class DerivedGraphNode(Base):
     document_ids: Mapped[list] = mapped_column(JSON, default=list)
     resolution: Mapped[str] = mapped_column(String(32))
     basis: Mapped[str] = mapped_column(Text)
+    review_status: Mapped[str] = mapped_column(String(16), default="candidate", server_default="candidate")
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class DossierSnapshot(Base):

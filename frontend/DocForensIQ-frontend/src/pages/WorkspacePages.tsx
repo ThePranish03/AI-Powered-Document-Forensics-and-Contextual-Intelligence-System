@@ -201,12 +201,13 @@ function boundingRect(value: unknown): { left: number; top: number; width: numbe
   return right > left && bottom > top ? { left, top, width: right - left, height: bottom - top } : null;
 }
 
-const ANALYSIS_SECTIONS = ['findings', 'timeline', 'visual', 'search', 'dossier', 'audit', 'ocr-evaluation'] as const;
+const ANALYSIS_SECTIONS = ['correlation', 'findings', 'timeline', 'visual', 'search', 'dossier', 'audit', 'ocr-evaluation'] as const;
 
 function CaseNav({ investigationId, current }: { investigationId: string; current: string }) {
   const links: Array<[string, string]> = [
     ['Documents', ''],
     ['Relationships', 'relationships'],
+    ['Cross-document', 'correlation'],
     ['Findings', 'findings'],
     ['Timeline', 'timeline'],
     ['Visual review', 'visual'],

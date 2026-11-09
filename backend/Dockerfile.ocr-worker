@@ -12,13 +12,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libglib2.0-0 libgl1 libgomp1 libsm6 libxext6 libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY DataOps/backend/requirements.lock /tmp/requirements.lock
+COPY backend/requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock
 
-COPY DataOps/backend/app ./app
-COPY DataOps/backend/scripts ./scripts
-COPY extra_things/PaddleOcr/ocr_evaluation/pyproject.toml /opt/ocr-evaluation/pyproject.toml
-COPY extra_things/PaddleOcr/ocr_evaluation/src /opt/ocr-evaluation/src
+COPY backend/app ./app
+COPY backend/scripts ./scripts
+COPY --from=ocr-evaluation /pyproject.toml /opt/ocr-evaluation/pyproject.toml
+COPY --from=ocr-evaluation /src /opt/ocr-evaluation/src
 
 RUN python -m venv /opt/paddle-venv \
     && /opt/paddle-venv/bin/pip install --no-cache-dir -e "/opt/ocr-evaluation[paddle]"

@@ -6,6 +6,7 @@ error rates are computed only when a non-empty ground-truth reference is supplie
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal, InvalidOperation
 import math
 import re
 from typing import Any
@@ -248,7 +249,7 @@ _LABELS = (
     ("tax", re.compile(rf"(?i)\b(?:tax|gst|vat)\b\s*[:\-]?\s*(?:INR|USD|EUR|Rs\.?|₹|\$|€)?\s*{_AMOUNT}")),
     ("total", re.compile(rf"(?i)\b(?:grand\s+total|total\s+amount|amount\s+due|total)\b\s*[:\-]?\s*(?:INR|USD|EUR|Rs\.?|₹|\$|€)?\s*{_AMOUNT}")),
 )
-_IDENTIFIER = re.compile(r"(?i)\b(?:invoice|inv|purchase\s*order|po|transaction|txn|account|reference|ref)(?:\s*(?:no|number|id|#))?\s*[:#\-]?\s*([A-Z0-9][A-Z0-9\-]{4,})")
+_IDENTIFIER = re.compile(r"(?i)\b(?P<label>invoice|inv|purchase\s*order|po|transaction|txn|account|reference|ref)(?:\s*(?:no|number|id|#))?\s*[:#\-]?\s*(?P<value>[A-Z0-9][A-Z0-9\-]{4,})")
 _ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _SLASH_DATE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
 
@@ -273,7 +274,7 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
     identifiers = []
     dates = []
     labeled: dict[str, dict[str, Any]] = {}
-    seen_identifiers: set[str] = set()
+    seen_identifiers: set[tuple[str, str]] = set()
     for block in blocks:
         text = str(block.get("text") or "")
         if text:
@@ -287,11 +288,17 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
             if match:
                 labeled[label] = {"value": _money(match.group(1)), "raw": match.group(1), "block_id": block_id, "page_index": page, "text": text}
         for match in _IDENTIFIER.finditer(text):
-            value = match.group(1).upper()
-            if value in seen_identifiers:
+            value = match.group("value").upper()
+            label = re.sub(r"\s+", " ", match.group("label").casefold())
+            entity_type = ("INVOICE" if label in {"invoice", "inv"} else
+                           "PURCHASE_ORDER" if label in {"purchase order", "po"} else
+                           "TRANSACTION" if label in {"transaction", "txn"} else
+                           "ACCOUNT" if label == "account" else "REFERENCE")
+            key = (entity_type, value)
+            if key in seen_identifiers:
                 continue
-            seen_identifiers.add(value)
-            identifiers.append({"value": value, "block_id": block_id, "page_index": page, "text": text})
+            seen_identifiers.add(key)
+            identifiers.append({"value": value, "entity_type": entity_type, "block_id": block_id, "page_index": page, "text": text})
         for match in _ISO_DATE.finditer(text):
             year, month, day = (int(match.group(i)) for i in (1, 2, 3))
             if _valid_date(year, month, day):
@@ -344,12 +351,12 @@ def analyze_documents(documents: list[dict]) -> dict[str, Any]:
     limitation = "This is a candidate signal from deterministic rules over OCR text. It is not a determination of fraud, authenticity, or intent."
 
     by_hash: dict[str, list[dict]] = {}
-    by_identifier: dict[str, list[tuple[dict, dict]]] = {}
+    by_identifier: dict[tuple[str, str], list[tuple[dict, dict]]] = {}
     for fact in facts:
         if fact["sha256"]:
             by_hash.setdefault(fact["sha256"], []).append(fact)
         for identifier in fact["identifiers"]:
-            by_identifier.setdefault(identifier["value"], []).append((fact, identifier))
+            by_identifier.setdefault((identifier["entity_type"], identifier["value"]), []).append((fact, identifier))
         amounts = fact["labeled_amounts"]
         if {"subtotal", "tax", "total"} <= set(amounts):
             expected = amounts["subtotal"]["value"] + amounts["tax"]["value"]
@@ -417,16 +424,16 @@ def analyze_documents(documents: list[dict]) -> dict[str, Any]:
             "evidence_refs": [_ref(item, quoted_text=item["sha256"]) for item in group],
             "limitations": "Identical bytes mean the stored files match. They do not explain why the file was uploaded again.",
         })
-    for value, occurrences in by_identifier.items():
+    for (entity_type, value), occurrences in by_identifier.items():
         docs = []
         for fact, identifier in occurrences:
             if fact["document_id"] not in {item["document_id"] for item in docs}:
                 docs.append(fact)
-        node_id = f"det:identifier:{value}"
+        node_id = f"det:identifier:{entity_type.lower()}:{value}"
         nodes[node_id] = {
             "canonical_id": node_id,
             "label": value,
-            "entity_type": "INVOICE",
+            "entity_type": entity_type,
             "document_ids": [fact["document_id"] for fact, _identifier in occurrences],
             "resolution": "identifier_match" if len(docs) > 1 else "candidate",
             "basis": "Explicit identifier text matched after case-folding. A single occurrence stays a candidate link, not a confirmed party.",
@@ -450,3 +457,108 @@ def analyze_documents(documents: list[dict]) -> dict[str, Any]:
                 "limitations": limitation + " The identifier match is textual. It does not prove the documents describe one transaction.",
             })
     return {"findings": findings, "timeline": timeline, "nodes": list(nodes.values()), "documents": facts}
+
+
+def build_cross_document_correlation(documents: list[dict]) -> dict[str, Any]:
+    """Build explainable investigation-scoped links from persisted OCR facts.
+
+    Only exact, typed document identifiers create cross-document links. Names,
+    dates, and amounts remain comparison fields and never create identity links.
+    Scores are rule ranks, not probabilities.
+    """
+    analyzed = analyze_documents(documents)
+    facts = analyzed["documents"]
+    links: list[dict[str, Any]] = []
+    comparisons: list[dict[str, Any]] = []
+    for node in analyzed["nodes"]:
+        document_ids = list(dict.fromkeys(node["document_ids"]))
+        if len(document_ids) < 2:
+            continue
+        value = node["label"]
+        occurrences: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for fact in facts:
+            if fact["document_id"] not in document_ids:
+                continue
+            occurrences.extend((fact, mention) for mention in fact["identifiers"] if mention["value"] == value and mention["entity_type"] == node["entity_type"])
+        references = [
+            _ref(fact, block_id=mention["block_id"], page_index=mention["page_index"],
+                 field_type="document_identifier", normalized_value=value,
+                 quoted_text=mention["text"])
+            for fact, mention in occurrences
+        ]
+        links.append({
+            "id": node["canonical_id"],
+            "relation_type": "shared_document_identifier",
+            "normalized_identifier": value,
+            "identifier_type": node["entity_type"],
+            "document_ids": document_ids,
+            "document_count": len(document_ids),
+            "rank": 1.0,
+            "rank_kind": "exact_rule_match",
+            "method": "exact_identifier_v1",
+            "explanation": "The same labeled document identifier appears in these source records. This is a review lead and does not prove they describe the same transaction or party.",
+            "evidence_refs": references,
+            "review_status": "candidate",
+        })
+        entries = []
+        distinct_totals: set[Decimal] = set()
+        for fact in facts:
+            if fact["document_id"] not in document_ids:
+                continue
+            amount = fact["labeled_amounts"].get("total")
+            if amount:
+                try:
+                    distinct_totals.add(Decimal(str(amount["value"])).quantize(Decimal("0.01")))
+                except (InvalidOperation, ValueError):
+                    pass
+            identifiers = [item for item in fact["identifiers"] if item["value"] == value and item["entity_type"] == node["entity_type"]]
+            if not identifiers:
+                continue
+            entries.append({
+                "document_id": fact["document_id"],
+                "filename": fact["filename"],
+                "total": ({
+                    "raw": amount["raw"],
+                    "value": amount["value"],
+                    "evidence_ref": _ref(fact, block_id=amount["block_id"], page_index=amount["page_index"], field_type="total", quoted_text=amount["text"]),
+                } if amount else None),
+                "dates": [{
+                    "raw": item["raw"], "interpreted": item["interpreted"], "ambiguous": item["ambiguous"],
+                    "evidence_ref": _ref(fact, block_id=item["block_id"], page_index=item["page_index"], field_type="date", quoted_text=item["text"]),
+                } for item in fact["dates"]],
+            })
+        has_conflict = len(distinct_totals) > 1
+        comparisons.append({
+            "id": node["canonical_id"],
+            "field": "document_identifier",
+            "value": value,
+            "status": "value_conflict" if has_conflict else "matched_identifier",
+            "documents": entries,
+            "explanation": "The exact identifier is shared. Labeled totals differ across sources." if has_conflict else "The exact identifier is shared. Missing values are not treated as agreement.",
+        })
+    status = "no_documents" if not documents else "ready" if any(doc.get("blocks") or doc.get("text") for doc in documents) else "no_ocr_results"
+    return {
+        "status": status,
+        "method": "deterministic_exact_identifier_v1",
+        "summary": {
+            "documents_total": len(documents),
+            "documents_with_ocr": sum(bool(fact["text"] or fact["identifiers"]) for fact in facts),
+            "documents_pending": sum(doc.get("processing_status") in {"pending", "queued", "processing", "relationship_extraction_pending"} for doc in documents),
+            "documents_with_processing_errors": sum(doc.get("processing_status") in {"failed", "relationship_extraction_failed"} for doc in documents),
+            "identifier_mentions": sum(len(fact["identifiers"]) for fact in facts),
+            "candidate_entities": len(analyzed["nodes"]),
+            "total_links": len(links),
+            "candidate_links": len(links),
+            "confirmed_links": 0,
+            "unreviewed_links": len(links),
+            "contradictions": sum(item["finding_type"] == "identifier_amount_conflict" for item in analyzed["findings"]),
+        },
+        "links": links,
+        "comparisons": comparisons,
+        "contradictions": [
+            {"id": item["fingerprint"], **item}
+            for item in analyzed["findings"]
+            if item["finding_type"] == "identifier_amount_conflict"
+        ],
+        "limitations": "Exact labeled identifiers are candidate links, not identity or transaction proof. Dates and amounts are comparison signals only. OCR uncertainty and unlabeled fields can affect results.",
+    }

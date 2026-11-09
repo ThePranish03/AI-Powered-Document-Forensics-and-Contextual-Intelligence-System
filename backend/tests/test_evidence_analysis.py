@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.main import app
 from app.models.entities import Document, OCRResult
 from app.services.audit_chain import event_hash, verify_audit_chain
-from app.services.ocr_metrics import analyze_documents, character_error_rate, detection_scores, evaluate_samples, extract_document_facts, word_error_rate
+from app.services.ocr_metrics import analyze_documents, build_cross_document_correlation, character_error_rate, detection_scores, evaluate_samples, extract_document_facts, word_error_rate
 
 
 PASSWORD = "StrongPassword123"
@@ -84,6 +84,50 @@ def test_extraction_gaps_are_not_reported_as_visual_forensics():
         "text": "",
     }])
     assert [finding["finding_type"] for finding in result["findings"]] == ["extraction_gap"]
+
+
+def test_cross_document_correlation_clusters_exact_identifier_with_all_citations():
+    documents = [{
+        "document_id": f"doc-{index}", "filename": f"invoice-{index}.png", "processing_status": "ocr_completed",
+        "blocks": [{"block_id": f"b-{index}", "page_index": 0, "text": f"Invoice No: INV-88421\nTotal: {total}.00\nDate: 2024-04-01"}],
+    } for index, total in enumerate((100, 100, 125), start=1)]
+    result = build_cross_document_correlation(documents)
+    assert result["summary"]["candidate_links"] == 1
+    assert result["summary"]["contradictions"] == 1
+    assert result["links"][0]["document_ids"] == ["doc-1", "doc-2", "doc-3"]
+    assert {ref["document_id"] for ref in result["links"][0]["evidence_refs"]} == {"doc-1", "doc-2", "doc-3"}
+    comparison = result["comparisons"][0]
+    assert comparison["status"] == "value_conflict"
+    assert all(row["total"]["evidence_ref"]["page_number"] == 1 for row in comparison["documents"])
+
+
+def test_cross_document_correlation_does_not_link_by_amount_or_date_alone():
+    documents = [{
+        "document_id": f"doc-{index}", "filename": f"record-{index}.png", "processing_status": "ocr_completed",
+        "blocks": [{"block_id": f"b-{index}", "page_index": 0, "text": f"Invoice No: REF-{index}001\nTotal: 100.00\nDate: 2024-04-01"}],
+    } for index in (1, 2)]
+    result = build_cross_document_correlation(documents)
+    assert result["links"] == []
+    assert result["comparisons"] == []
+    assert result["summary"]["contradictions"] == 0
+
+
+def test_cross_document_correlation_keeps_identifier_types_separate():
+    docs = [
+        {"document_id": "invoice", "filename": "invoice.png", "blocks": [{"block_id": "i", "text": "Invoice No: SAME-1001"}]},
+        {"document_id": "reference", "filename": "reference.png", "blocks": [{"block_id": "r", "text": "Reference No: SAME-1001"}]},
+    ]
+    result = build_cross_document_correlation(docs)
+    assert result["links"] == []
+
+
+def test_cross_document_correlation_empty_ocr_produces_no_unsupported_links():
+    result = build_cross_document_correlation([{
+        "document_id": "empty", "filename": "empty.png", "processing_status": "ocr_completed", "blocks": [], "text": "",
+    }])
+    assert result["status"] == "no_ocr_results"
+    assert result["links"] == []
+    assert result["summary"]["candidate_links"] == 0
 
 
 @pytest.mark.asyncio
@@ -165,9 +209,36 @@ async def test_analysis_review_dossier_and_evaluation(client, monkeypatch, tmp_p
     assert len(identifier["document_ids"]) == 2
     assert identifier["resolution"] == "identifier_match"
 
+    correlation_response = await client.get(f"/api/v1/investigations/{case_id}/correlation")
+    assert correlation_response.status_code == 200
+    correlation = correlation_response.json()
+    assert correlation["summary"]["documents_with_ocr"] == 2
+    assert correlation["summary"]["candidate_links"] == 1
+    assert correlation["summary"]["contradictions"] == 1
+    assert {ref["document_id"] for ref in correlation["links"][0]["evidence_refs"]} == set(texts)
+    candidate_id = correlation["links"][0]["id"]
+    reviewed = await client.patch(
+        f"/api/v1/investigations/{case_id}/correlation/{candidate_id}/review",
+        headers=headers,
+        json={"status": "confirmed", "reason": "Verified the cited source fields."},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["review_status"] == "confirmed"
+    rerun = await client.post(f"/api/v1/investigations/{case_id}/correlation-runs", headers=headers)
+    assert rerun.status_code == 201
+    assert len(rerun.json()["links"]) == 1
+    after_rerun = (await client.get(f"/api/v1/investigations/{case_id}/correlation")).json()
+    assert after_rerun["summary"]["confirmed_links"] == 1
+    assert after_rerun["summary"]["unreviewed_links"] == 0
+    assert after_rerun["links"][0]["review_reason"] == "Verified the cited source fields."
+
     dossier = await client.post(f"/api/v1/investigations/{case_id}/dossiers", headers=headers)
     assert dossier.status_code == 201
     assert "INV-10001" in dossier.json()["html"]
+    assert dossier.json()["snapshot"]["cross_document_links"][0]["review_status"] == "confirmed"
+    assert "invoice-a.png" in dossier.json()["html"]
+    assert len(dossier.json()["snapshot"]["cross_document_discrepancies"]) == 1
+    assert "labeled totals" in dossier.json()["html"]
     assert "Not included" in dossier.json()["html"]
     audit = (await client.get(f"/api/v1/investigations/{case_id}/audit")).json()["items"]
     audit_response = await client.get(f"/api/v1/investigations/{case_id}/audit")
@@ -192,3 +263,5 @@ async def test_analysis_review_dossier_and_evaluation(client, monkeypatch, tmp_p
     assert outsider.status_code == 201
     hidden = await client.get(f"/api/v1/investigations/{case_id}/findings")
     assert hidden.status_code == 404
+    hidden_correlation = await client.get(f"/api/v1/investigations/{case_id}/correlation")
+    assert hidden_correlation.status_code == 404

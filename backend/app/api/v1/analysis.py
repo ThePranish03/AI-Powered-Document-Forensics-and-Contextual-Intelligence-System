@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, TimelineEvent, User
 from app.services.audit_chain import append_audit, verify_audit_chain
 from app.services.investigation_analysis import _finding_dict, _timeline_dict, create_dossier, run_investigation_analysis
-from app.services.ocr_metrics import evaluate_samples
+from app.services.ocr_metrics import build_cross_document_correlation, evaluate_samples
 
 router = APIRouter()
 REVIEW_STATUSES = {"accepted", "rejected", "dismissed", "needs_review"}
@@ -62,6 +62,46 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=300)
 
 
+class CorrelationReview(BaseModel):
+    status: str
+    reason: str = Field(min_length=1, max_length=4000)
+
+
+async def _correlation_data(db: AsyncSession, investigation_id: UUID) -> dict:
+    rows = (await db.execute(
+        select(Document, OCRResult)
+        .outerjoin(OCRResult, OCRResult.document_id == Document.id)
+        .where(Document.investigation_id == investigation_id)
+        .order_by(Document.created_at, Document.id)
+    )).all()
+    documents = [{
+        "document_id": str(document.id),
+        "filename": document.filename,
+        "sha256": document.sha256,
+        "provider": result.provider if result else None,
+        "provider_version": result.provider_version if result else None,
+        "blocks": result.blocks if result else [],
+        "text": result.recognized_text if result else "",
+        "processing_status": document.processing_status,
+    } for document, result in rows]
+    payload = build_cross_document_correlation(documents)
+    review_nodes = {
+        item.canonical_id: item
+        for item in (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation_id))).all()
+    }
+    for link in payload["links"]:
+        item = review_nodes.get(link["id"])
+        if item:
+            link["review_status"] = item.review_status
+            link["reviewed_at"] = item.reviewed_at.isoformat() if item.reviewed_at else None
+            link["review_reason"] = item.review_reason
+    payload["summary"]["confirmed_links"] = sum(link["review_status"] == "confirmed" for link in payload["links"])
+    payload["summary"]["rejected_links"] = sum(link["review_status"] == "rejected" for link in payload["links"])
+    payload["summary"]["unreviewed_links"] = sum(link["review_status"] == "candidate" for link in payload["links"])
+    payload["summary"]["candidate_links"] = payload["summary"]["unreviewed_links"]
+    return payload
+
+
 def _dossier_summary(item: DossierSnapshot) -> dict:
     return {
         "id": str(item.id),
@@ -77,6 +117,79 @@ async def start_analysis(investigation_id: UUID, request: Request, db: AsyncSess
     require_csrf(request)
     investigation = await owned_investigation(db, user, investigation_id)
     return await run_investigation_analysis(db, investigation, user.id)
+
+
+@router.get("/{investigation_id}/correlation")
+async def get_cross_document_correlation(investigation_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    return await _correlation_data(db, investigation_id)
+
+
+@router.post("/{investigation_id}/correlation-runs", status_code=201)
+async def rerun_cross_document_correlation(investigation_id: UUID, request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:update"))):
+    require_csrf(request)
+    investigation = await owned_investigation(db, user, investigation_id)
+    result = await run_investigation_analysis(db, investigation, user.id)
+    await append_audit(
+        db,
+        investigation_id=investigation.id,
+        actor_user_id=user.id,
+        action="correlation.completed",
+        target_type="investigation",
+        target_id=str(investigation.id),
+        details={"method": "deterministic_exact_identifier_v1", "documents_considered": result["documents_considered"]},
+    )
+    await db.commit()
+    return await _correlation_data(db, investigation_id)
+
+
+@router.patch("/{investigation_id}/correlation/{canonical_id}/review")
+async def review_correlation_candidate(investigation_id: UUID, canonical_id: str, payload: CorrelationReview, request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:update"))):
+    require_csrf(request)
+    await owned_investigation(db, user, investigation_id)
+    if payload.status not in {"confirmed", "rejected"}:
+        raise HTTPException(status_code=422, detail="Correlation review status must be confirmed or rejected")
+    correlation = await _correlation_data(db, investigation_id)
+    link = next((item for item in correlation["links"] if item["id"] == canonical_id), None)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Correlation candidate not found")
+    node = await db.scalar(select(DerivedGraphNode).where(
+        DerivedGraphNode.investigation_id == investigation_id,
+        DerivedGraphNode.canonical_id == canonical_id,
+    ))
+    if node is None:
+        node = DerivedGraphNode(
+            investigation_id=investigation_id,
+            canonical_id=canonical_id,
+            label=link["normalized_identifier"],
+            entity_type=link["identifier_type"],
+            document_ids=link["document_ids"],
+            resolution="identifier_match",
+            basis=link["explanation"],
+        )
+        db.add(node)
+    node.review_status = payload.status
+    node.reviewed_by_user_id = user.id
+    node.reviewed_at = datetime.now(timezone.utc)
+    node.review_reason = payload.reason.strip()
+    if not node.review_reason:
+        raise HTTPException(status_code=422, detail="Review reason must not be blank")
+    await append_audit(
+        db,
+        investigation_id=investigation_id,
+        actor_user_id=user.id,
+        action="correlation.reviewed",
+        target_type="correlation_candidate",
+        target_id=canonical_id,
+        details={"status": payload.status, "reason": node.review_reason},
+    )
+    await db.commit()
+    return {
+        "id": canonical_id,
+        "review_status": node.review_status,
+        "reviewed_at": node.reviewed_at.isoformat(),
+        "review_reason": node.review_reason,
+    }
 
 
 @router.get("/{investigation_id}/findings")

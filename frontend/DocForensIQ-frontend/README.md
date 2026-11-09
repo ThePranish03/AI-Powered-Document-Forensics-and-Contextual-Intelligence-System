@@ -26,12 +26,12 @@ Configure the API and registration policy in `.env.local` using `.env.example`. 
 
 - The Home dashboard, account/session flow, investigation list, and investigation creation use the backend. Investigation workspaces support multi-file image/PDF uploads, OCR status and source-block review, and an API-backed relationship explorer.
 - `VITE_USE_MOCK_API=true` explicitly enables the legacy local forensic demo. All seeded records, findings, scores, hashes, and source previews remain synthetic examples.
-- With the demo flag disabled (the default), relationships use persisted extraction results; findings, comparison, timeline, and other not-yet-connected analysis routes do not treat seeded demo analysis as live output.
+- With the demo flag disabled (the default), relationships use persisted extraction results and the Cross-document tab compares stored OCR results using exact typed identifiers. Findings, timeline, search, dossier, audit, and OCR evaluation use their corresponding backend APIs.
 - Supported source files are uploaded to the backend with a 25 MiB per-file limit and SHA-256 metadata. Uploads run sequentially and report partial failures. Duplicate detection is unavailable.
-- Review actions require a rationale and confirmation, then update local UI state only. They are not stored in an immutable backend audit log.
+- Legacy demo review actions update local UI state only. Cross-document candidate decisions are stored on the server with the reviewer, timestamp, reason, and a hash-chained audit event.
 - Dossier downloads are local TXT or JSON summaries. No PDF renderer, signature, forensic verification, chain-of-custody service, security assessment, or compliance evidence is connected.
 - Relationship model confidence is uncalibrated. OCR confidence and analysis confidence remain separate labels.
 
 ## Main routes
 
-`/login`, optional `/register`, `/forgot-password`, `/reset-password`, `/`, `/investigations`, `/investigations/new`, and investigation-specific document and relationship routes. In explicit demo mode, the original case workspaces remain available, including processing, classification, structure/visual forensics, extracted data, evidence, comparison, relationships, findings, timeline, dossier, audit, custody, explainability, standards, security/privacy, lifecycle, limitations, and reports.
+`/login`, optional `/register`, `/forgot-password`, `/reset-password`, `/`, `/investigations`, `/investigations/new`, and investigation-specific document, relationship, and cross-document routes. In explicit demo mode, the original case workspaces remain available, including processing, classification, structure/visual forensics, extracted data, evidence, comparison, relationships, findings, timeline, dossier, audit, custody, explainability, standards, security/privacy, lifecycle, limitations, and reports.
