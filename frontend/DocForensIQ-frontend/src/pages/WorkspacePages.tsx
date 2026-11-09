@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState, type DragEvent, type FormEvent, type ReactNode } from 'react';
-import { Activity, ArrowRight, BriefcaseBusiness, CheckCircle2, Clock3, FileText, Fingerprint, Home, LogOut, Menu, Network, Plus, ShieldCheck } from 'lucide-react';
+import { Activity, ArrowRight, Bell, BookOpen, BriefcaseBusiness, CheckCircle2, ChevronDown, ChevronLeft, Clock3, Eye, FileCheck2, FileImage, FileSearch, FileText, Fingerprint, GitBranch, Home, Layers3, LogOut, Menu, Network, Plus, Search, ShieldCheck, SlidersHorizontal, type LucideIcon } from 'lucide-react';
 import { Link, NavLink, Outlet, useNavigate, useParams, useLocation, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../auth/useAuth';
+import { mockApiEnabled } from '../auth/config';
 import { apiBlob, apiRequest, ApiError } from '../services/apiClient';
 import RelationshipExplorer, { type RelationshipClaim, type RelationshipDocument, type RelationshipEntity } from '../features/relationships/RelationshipExplorer';
 import EvidenceGraphView from '../features/relationships/EvidenceGraphView';
@@ -18,10 +19,26 @@ const fmtDate = (value: string) => new Intl.DateTimeFormat(undefined, { dateStyl
 export function WorkspaceLayout({ children }: { children?: ReactNode }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [accountOpen, setAccountOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState('');
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const selector = useQuery({
+    queryKey: ['workspace', 'investigation-selector'],
+    queryFn: () => apiRequest<Investigation[]>('/dashboard/recent-investigations?limit=20'),
+    enabled: Boolean(user),
+  });
+  const selectorItems = Array.isArray(selector.data) ? selector.data : [];
+  const pathMatch = location.pathname.match(/^\/investigations\/([^/]+)/);
+  const activeInvestigationId = pathMatch?.[1] && pathMatch[1] !== 'new' ? pathMatch[1] : '';
+  const investigationPath = activeInvestigationId ? `/investigations/${activeInvestigationId}` : '';
+  const activeInvestigation = selectorItems.find((item) => item.id === activeInvestigationId);
+  useEffect(() => {
+    setSearchText(new URLSearchParams(location.search).get('search') ?? '');
+  }, [location.search]);
   async function signOut() {
     setLoggingOut(true);
     setLogoutError('');
@@ -29,26 +46,99 @@ export function WorkspaceLayout({ children }: { children?: ReactNode }) {
     catch { setLogoutError('Sign out could not be completed. Retry to revoke this session.'); setLoggingOut(false); }
   }
   const initials = user?.full_name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || 'DF';
+  const currentPage = location.pathname.split('/').filter(Boolean).at(-1) || 'workspace';
+  const pageLabels: Record<string, string> = {
+    new: 'New investigation',
+    processing: 'Processing',
+    classification: 'Classification',
+    structure: 'Structure & visual forensics',
+    visual: 'Structure & visual forensics',
+    'extracted-data': 'Extracted data',
+    evidence: 'Evidence viewer',
+    compare: 'Cross-document comparison',
+    correlation: 'Cross-document comparison',
+    relationships: 'Relationship map',
+    findings: 'Findings',
+    timeline: 'Timeline',
+    dossier: 'Dossier',
+    audit: 'Audit trail',
+    investigations: 'Investigations',
+    workspace: 'Overview',
+  };
+  const pageTitle = activeInvestigationId && currentPage === activeInvestigationId
+    ? 'Overview' : pageLabels[currentPage] ?? currentPage.replaceAll('-', ' ');
+  const currentCaseTitle = activeInvestigation?.title || activeInvestigation?.case_number || activeInvestigationId;
+  const workspaceLinks = [
+    { label: 'Home', to: '/', icon: Home, end: true },
+    { label: 'Investigations', to: '/investigations', icon: BriefcaseBusiness, end: true },
+    { label: 'New investigation', to: '/investigations/new', icon: Plus, end: true },
+    { label: 'Reports', to: investigationPath ? `${investigationPath}/dossier` : '/investigations', icon: FileText, end: true },
+  ];
+  const investigationLinks = investigationPath ? [
+    { label: 'Overview', to: investigationPath, icon: Layers3, end: true },
+    { label: 'Processing', to: `${investigationPath}/processing`, icon: Activity },
+    { label: 'Classification', to: `${investigationPath}/classification`, icon: FileCheck2 },
+    { label: 'Structure & Visual Forensics', to: `${investigationPath}/visual`, icon: FileImage },
+    { label: 'Extracted Data', to: `${investigationPath}/extracted-data`, icon: FileText },
+    { label: 'Evidence Viewer', to: `${investigationPath}/evidence`, icon: Eye },
+    { label: 'Cross-Document Comparison', to: `${investigationPath}/correlation`, icon: SlidersHorizontal },
+    { label: 'Relationship Map', to: `${investigationPath}/relationships`, icon: Network },
+    { label: 'Findings', to: `${investigationPath}/findings`, icon: FileSearch },
+    { label: 'Timeline', to: `${investigationPath}/timeline`, icon: Clock3 },
+    { label: 'Dossier', to: `${investigationPath}/dossier`, icon: BookOpen },
+  ] : [];
+  const governanceLinks = investigationPath
+    ? [{ label: 'Audit Trail', to: `${investigationPath}/audit`, icon: Fingerprint }]
+    : [];
+  const legacyCaseRoute = mockApiEnabled && Boolean(activeInvestigationId);
+  if (legacyCaseRoute) return <>{children ?? <Outlet/>}</>;
+
   return <div className="shell">
-    <aside className={`sidebar workspace-sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
+    <aside className={`sidebar workspace-sidebar ${collapsed ? 'collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
       <Link to="/" className="brand"><span className="brand-mark"><Fingerprint size={18}/></span><span>DocForens<span className="lime">IQ</span></span></Link>
-      <div className="workspace-badge"><span className="case-icon"><BriefcaseBusiness size={15}/></span><div><small>WORKSPACE</small><strong>Investigator desk</strong></div></div>
-      <nav aria-label="Workspace navigation">
-        <div className="nav-label">WORKSPACE</div>
-        <NavLink end to="/" title="Home" aria-label="Home" onClick={() => setMobileOpen(false)} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}><Home size={17}/><span>Home</span></NavLink>
-        <NavLink end to="/investigations" title="Investigations" aria-label="Investigations" onClick={() => setMobileOpen(false)} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}><BriefcaseBusiness size={17}/><span>Investigations</span></NavLink>
+      <label className="workspace-selector">
+        <span>Active investigation</span>
+        <span className="workspace-selector-control"><BriefcaseBusiness size={15}/><select aria-label="Active investigation" value={activeInvestigationId} onChange={(event) => {
+          if (event.target.value) navigate(`/investigations/${event.target.value}`);
+        }}>
+          <option value="">{selector.isLoading ? 'Loading investigations…' : 'Select an investigation'}</option>
+          {activeInvestigationId && !selectorItems.some((item) => item.id === activeInvestigationId) && <option value={activeInvestigationId}>{currentCaseTitle}</option>}
+          {selectorItems.map((item) => <option value={item.id} key={item.id}>{item.case_number} · {item.title}</option>)}
+        </select><ChevronDown size={13}/></span>
+      </label>
+      {selector.isError && !collapsed && <p className="workspace-selector-error" role="status">Investigation list unavailable.</p>}
+      <nav className="workspace-nav" aria-label="Workspace navigation">
+        <div className="nav-group">
+          {!collapsed && <div className="nav-label">WORKSPACE</div>}
+          {workspaceLinks.map(({ label, to, icon: Icon, end }) => <NavLink key={label} end={end} to={to} title={collapsed ? label : undefined} aria-label={collapsed ? label : undefined} onClick={() => setMobileOpen(false)} className={({ isActive }) => `nav-link ${isActive && label !== 'Reports' ? 'active' : ''}`}><Icon size={16}/><span>{label}</span></NavLink>)}
+        </div>
+        {investigationLinks.length > 0 && <div className="nav-group">
+          {!collapsed && <div className="nav-label">INVESTIGATION</div>}
+          {investigationLinks.map(({ label, to, icon: Icon, end }) => <NavLink key={label} end={end} to={to} title={collapsed ? label : undefined} aria-label={collapsed ? label : undefined} onClick={() => setMobileOpen(false)} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}><Icon size={16}/><span>{label}</span></NavLink>)}
+        </div>}
+        {governanceLinks.length > 0 && <div className="nav-group">
+          {!collapsed && <div className="nav-label">GOVERNANCE</div>}
+          {governanceLinks.map(({ label, to, icon: Icon }) => <NavLink key={label} to={to} title={collapsed ? label : undefined} aria-label={collapsed ? label : undefined} onClick={() => setMobileOpen(false)} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}><Icon size={16}/><span>{label}</span></NavLink>)}
+        </div>}
       </nav>
-      <div className="side-bottom"><div className="demo-pill"><span className="pulse-dot"/>SECURE SESSION</div></div>
+      <div className="side-bottom">
+        {!collapsed && <div className="demo-pill"><span className="pulse-dot"/>SECURE SESSION</div>}
+        <button className="collapse-btn" type="button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}><ChevronLeft size={16}/>{!collapsed && 'Collapse navigation'}</button>
+      </div>
     </aside>
     {mobileOpen && <button className="scrim" onClick={() => setMobileOpen(false)} aria-label="Close navigation"/>}
     <div className="main-shell">
-      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileOpen(true)} aria-label="Open navigation"><Menu size={18}/></button><div className="crumb"><span>Workspace</span></div><div className="top-actions">
+      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileOpen(true)} aria-label="Open navigation"><Menu size={18}/></button><nav className="crumb" aria-label="Breadcrumb"><Link to="/">Workspace</Link><span aria-hidden="true">/</span>{activeInvestigationId && <><Link to={investigationPath}>{currentCaseTitle}</Link><span aria-hidden="true">/</span></>}<b>{pageTitle}</b></nav><div className="top-actions">
+        <form className="global-search" role="search" onSubmit={(event) => { event.preventDefault(); navigate(searchText.trim() ? `/investigations?search=${encodeURIComponent(searchText.trim())}` : '/investigations'); }}>
+          <Search size={15}/><input aria-label="Search investigations" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Search investigations…"/><kbd>Enter</kbd>
+        </form>
+        <Link className="icon-button" to={investigationPath ? `${investigationPath}/audit` : '/'} aria-label={activeInvestigationId ? 'Open investigation audit trail' : 'Open workspace dashboard activity'}><Bell size={16}/></Link>
         <div className="account-wrap"><button className="account-trigger" aria-label={`Account: ${user?.full_name}`} aria-expanded={accountOpen} onClick={() => setAccountOpen((open) => !open)}><span className="avatar">{initials}</span><span className="account-name">{user?.full_name}</span></button>
           {accountOpen && <div className="account-menu"><div className="account-menu-user"><b>{user?.full_name}</b><small>{user?.email}</small><span>{user?.role}</span></div>{logoutError && <p className="account-error" role="alert">{logoutError}</p>}<button onClick={() => void signOut()} disabled={loggingOut}><LogOut size={15}/>{loggingOut ? 'Signing out…' : 'Sign out'}</button></div>}
         </div>
       </div></header>
       <main className="content">{children ?? <Outlet/>}</main>
-      <footer className="footer"><span><span className="pulse-dot"/> AUTHENTICATED WORKSPACE</span><span>Image upload and configured OCR worker · Relationship analysis requires Grok setup</span><span>v0.2.0</span></footer>
+      <footer className="footer"><span><span className="pulse-dot"/> AUTHENTICATED WORKSPACE</span><span>Evidence remains linked to its source document</span><span>v0.2.0</span></footer>
     </div>
   </div>;
 }
@@ -96,17 +186,49 @@ export function DashboardPage() {
   const error = summary.isError || recent.isError || activity.isError;
   const loading = summary.isLoading || recent.isLoading || activity.isLoading;
   const canCreate = user?.permissions.includes('investigations:create') ?? false;
+  const activeCasePath = recent.data?.[0]?.id ? `/investigations/${recent.data[0].id}` : '';
+  const fallbackPath = canCreate ? '/investigations/new' : '/investigations';
   return <section className="dashboard-page">
-    <div className="dashboard-welcome"><div><div className="eyebrow"><ShieldCheck size={13}/> EVIDENCE-LED DOCUMENT INTELLIGENCE</div><h1>Good to have you back, {user?.full_name.split(' ')[0]}.</h1><p>Your workspace, investigations, and recent activity.</p></div>
-      {canCreate && <Link className="button primary" to="/investigations/new"><Plus size={16}/> New Investigation</Link>}
-    </div>
-    {error ? <QueryError onRetry={retry}/> : loading ? <LoadingPanel/> : <>
-      <div className="stat-grid dashboard-stats">
-        <article className="stat-card"><BriefcaseBusiness className="stat-icon" size={18}/><span className="stat-label">TOTAL INVESTIGATIONS</span><strong>{summary.data?.total_investigations ?? 0}</strong><small>Cases in your workspace</small></article>
-        <article className="stat-card"><Activity className="stat-icon lime" size={18}/><span className="stat-label">ACTIVE</span><strong>{summary.data?.active_investigations ?? 0}</strong><small>Draft or in progress</small></article>
-        <article className="stat-card"><Clock3 className="stat-icon amber" size={18}/><span className="stat-label">IN REVIEW</span><strong>{summary.data?.in_review_investigations ?? 0}</strong><small>Awaiting review</small></article>
-        <article className="stat-card"><CheckCircle2 className="stat-icon lime" size={18}/><span className="stat-label">COMPLETED</span><strong>{summary.data?.completed_investigations ?? 0}</strong><small>Completed investigations</small></article>
+    <section className="dashboard-hero" aria-labelledby="dashboard-title">
+      <div className="dashboard-hero-copy">
+        <div className="eyebrow"><Fingerprint size={14}/> DOCFORENSIQ FORENSIC WORKSPACE</div>
+        <h2 className="dashboard-greeting">Good to have you back, {user?.full_name.split(' ')[0]}.</h2>
+        <h1 id="dashboard-title">Beyond OCR. <span>Evidence-led document intelligence.</span></h1>
+        <p>Investigate documents, compare evidence across a case, and keep every observation connected to its source.</p>
+        <div className="hero-buttons">
+          <Link className="button primary" to={fallbackPath}>{canCreate ? 'Start investigation' : 'Explore investigations'} <ArrowRight size={15}/></Link>
+          <a className="button secondary" href="#workflow-cards">Explore workflow <ArrowRight size={14}/></a>
+        </div>
       </div>
+      <div className="dashboard-hero-visual" aria-hidden="true">
+        <div className="forensic-document">
+          <div className="forensic-document-head"><Fingerprint size={15}/><span>Source document</span><i/></div>
+          <div className="forensic-document-lines"><i/><i/><i/><i/><i/><i/></div>
+          <div className="forensic-region"><i/><i/><i/></div>
+          <div className="forensic-document-footer"><span/><span/><span/></div>
+        </div>
+        <div className="forensic-lens"><Fingerprint size={28}/></div>
+        <div className="forensic-index-mark">01 <span>Evidence in context</span></div>
+      </div>
+    </section>
+    <div className="dashboard-greeting-row"><span>Your workspace, investigations, and recent activity.</span>{canCreate && <Link className="text-link" to="/investigations/new"><Plus size={14}/> New investigation</Link>}</div>
+    <div className="stat-grid dashboard-stats">
+      <article className="stat-card"><FileImage className="stat-icon" size={18}/><span className="stat-label">DOCUMENTS</span><strong>—</strong><small>Not available in the workspace summary</small></article>
+      <article className="stat-card"><FileSearch className="stat-icon amber" size={18}/><span className="stat-label">CANDIDATE FINDINGS</span><strong>—</strong><small>Not available in the workspace summary</small></article>
+      <article className="stat-card"><BriefcaseBusiness className="stat-icon" size={18}/><span className="stat-label">INVESTIGATIONS</span><strong>{summary.data?.total_investigations ?? '—'}</strong><small>Cases in your workspace</small></article>
+      <article className="stat-card"><CheckCircle2 className="stat-icon lime" size={18}/><span className="stat-label">REVIEW COMPLETION</span><strong>—</strong><small>Not available in the workspace summary</small></article>
+    </div>
+    <section className="dashboard-workflows" id="workflow-cards" aria-labelledby="workflow-title">
+      <div className="dashboard-section-heading"><div><span className="eyebrow">INVESTIGATOR WORKFLOW</span><h2 id="workflow-title">Evidence, from source to review</h2></div><Link className="text-link" to="/investigations">View investigations <ArrowRight size={14}/></Link></div>
+      <div className="workflow-grid">
+        <WorkflowCard icon={FileSearch} title="Intelligent Extraction" description="Inspect recognized content and source-linked regions." to={activeCasePath ? `${activeCasePath}/extracted-data` : fallbackPath}/>
+        <WorkflowCard icon={FileImage} title="Visual Forensics" description="Review measured checks against stored originals." to={activeCasePath ? `${activeCasePath}/visual` : fallbackPath}/>
+        <WorkflowCard icon={GitBranch} title="Cross-Document Analysis" description="Compare evidence and review candidate relationships." to={activeCasePath ? `${activeCasePath}/correlation` : fallbackPath}/>
+        <WorkflowCard icon={Fingerprint} title="Evidence Traceability" description="Open source documents, pages, and cited regions." to={activeCasePath || fallbackPath}/>
+        <WorkflowCard icon={Eye} title="Human Oversight" description="Review candidate findings and record dispositions." to={activeCasePath ? `${activeCasePath}/findings` : fallbackPath}/>
+      </div>
+    </section>
+    {error ? <QueryError onRetry={retry}/> : loading ? <LoadingPanel/> : <>
       {(recent.data?.length ?? 0) === 0 ? <>
         <div className="panel dashboard-empty">
           <div className="empty-illustration"><BriefcaseBusiness size={21}/><Plus size={14}/></div><h2>Your workspace is ready</h2>
@@ -127,14 +249,25 @@ export function DashboardPage() {
   </section>;
 }
 
+function WorkflowCard({ icon: Icon, title, description, to }: { icon: LucideIcon; title: string; description: string; to: string }) {
+  return <Link className="workflow-card" to={to}>
+    <span className="workflow-icon"><Icon size={18}/></span>
+    <span className="workflow-copy"><strong>{title}</strong><small>{description}</small></span>
+    <ArrowRight className="workflow-arrow" size={15}/>
+  </Link>;
+}
+
 export function InvestigationsPage() {
   const [status, setStatus] = useState('');
+  const [searchParams] = useSearchParams();
+  const searchText = searchParams.get('search')?.trim().toLocaleLowerCase() ?? '';
   const query = useQuery({ queryKey: ['investigations', status], queryFn: () => apiRequest<{ items: Investigation[] }>('/investigations?limit=100' + (status ? `&status=${status}` : '')) });
+  const items = (query.data?.items ?? []).filter((item) => !searchText || `${item.case_number} ${item.title} ${item.status}`.toLocaleLowerCase().includes(searchText));
   return <section className="dashboard-page">
-    <div className="dashboard-welcome"><div><div className="eyebrow"><BriefcaseBusiness size={13}/> WORKSPACE</div><h1>Investigations</h1><p>Browse and resume investigations you own.</p></div><Link className="button primary" to="/investigations/new"><Plus size={16}/> New Investigation</Link></div>
+    <div className="dashboard-welcome"><div><div className="eyebrow"><BriefcaseBusiness size={13}/> WORKSPACE</div><h1>Investigations</h1><p>Browse and resume investigations you own.{searchText && <> Showing results for <strong>{searchParams.get('search')}</strong>.</>}</p></div><Link className="button primary" to="/investigations/new"><Plus size={16}/> New Investigation</Link></div>
     <div className="list-toolbar"><label className="auth-label">Filter by status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option><option value="draft">Draft</option><option value="in_progress">In progress</option><option value="in_review">In review</option><option value="completed">Completed</option><option value="archived">Archived</option></select></label></div>
-    {query.isLoading ? <LoadingPanel/> : query.isError ? <QueryError onRetry={() => void query.refetch()}/> : (query.data?.items.length ?? 0) === 0 ? <div className="panel dashboard-empty"><BriefcaseBusiness size={24}/><h2>No investigations found</h2><p>Create your first investigation or change the status filter.</p><Link className="button primary" to="/investigations/new"><Plus size={16}/> Create investigation</Link></div> :
-      <section className="panel recent-panel"><div className="table-wrap"><table className="dashboard-table"><thead><tr><th>CASE ID</th><th>TITLE</th><th>STATUS</th><th>DOCUMENTS</th><th>UPDATED</th><th>ACTIONS</th></tr></thead><tbody>{(query.data?.items ?? []).map((item) => <tr key={item.id}><td><span className="case-id">{item.case_number}</span></td><td><b>{item.title}</b></td><td><StatusBadge value={item.status}/></td><td>{item.document_count}</td><td>{fmtDate(item.updated_at)}</td><td><div className="case-row-actions"><Link className="text-link" aria-label={`Open ${item.case_number}`} to={`/investigations/${item.id}`}>Documents</Link><Link className="text-link" to={`/investigations/${item.id}/relationships`}>Relationships</Link></div></td></tr>)}</tbody></table></div></section>}
+    {query.isLoading ? <LoadingPanel/> : query.isError ? <QueryError onRetry={() => void query.refetch()}/> : items.length === 0 ? <div className="panel dashboard-empty"><BriefcaseBusiness size={24}/><h2>{searchText ? 'No matching investigations' : 'No investigations found'}</h2><p>{searchText ? 'Try another search or clear the search field in the top bar.' : 'Create your first investigation or change the status filter.'}</p><Link className="button primary" to="/investigations/new"><Plus size={16}/> Create investigation</Link></div> :
+      <section className="panel recent-panel"><div className="table-wrap"><table className="dashboard-table"><thead><tr><th>CASE ID</th><th>TITLE</th><th>STATUS</th><th>DOCUMENTS</th><th>UPDATED</th><th>ACTIONS</th></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><span className="case-id">{item.case_number}</span></td><td><b>{item.title}</b></td><td><StatusBadge value={item.status}/></td><td>{item.document_count}</td><td>{fmtDate(item.updated_at)}</td><td><div className="case-row-actions"><Link className="text-link" aria-label={`Open ${item.case_number}`} to={`/investigations/${item.id}`}>Documents</Link><Link className="text-link" to={`/investigations/${item.id}/relationships`}>Relationships</Link></div></td></tr>)}</tbody></table></div></section>}
   </section>;
 }
 
@@ -247,6 +380,8 @@ export function InvestigationUnavailable() {
   useEffect(() => {
     const requested = searchParams.get('doc');
     if (requested) setSelectedDocumentId(requested);
+    const block = searchParams.get('block');
+    if (block) setSelectedBlockId(block);
   }, [searchParams]);
 
   const investigation = useQuery({
@@ -291,10 +426,26 @@ export function InvestigationUnavailable() {
     enabled: Boolean(selectedDocumentId && !relationshipsPage),
     retry: false,
   });
+  const visualPage = Math.max(1, Number(searchParams.get('page')) || 1);
+  const visualRegion = ['x0', 'y0', 'x1', 'y1'].every((key) => Number.isFinite(Number(searchParams.get(key))) && searchParams.get(key) !== null)
+    ? { x0: Number(searchParams.get('x0')), y0: Number(searchParams.get('y0')), x1: Number(searchParams.get('x1')), y1: Number(searchParams.get('y1')) }
+    : null;
+  const sourcePagePreview = useQuery({
+    queryKey: ['source-page-preview', investigationId, selectedDocumentId, visualPage],
+    queryFn: () => apiBlob(`/investigations/${investigationId}/documents/${selectedDocumentId}/pages/${visualPage}/preview`),
+    enabled: Boolean(selectedDocumentId && selectedDocument?.content_type === 'application/pdf' && visualRegion),
+    retry: false,
+  });
+  const sourcePagePreviewUrl = useMemo(() => sourcePagePreview.data && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(sourcePagePreview.data) : '', [sourcePagePreview.data]);
+  useEffect(() => () => { if (sourcePagePreviewUrl) URL.revokeObjectURL(sourcePagePreviewUrl); }, [sourcePagePreviewUrl]);
   const sourcePreviewUrl = useMemo(() => sourceFile.data && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(sourceFile.data) : '', [sourceFile.data]);
   useEffect(() => () => {
     if (sourcePreviewUrl && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(sourcePreviewUrl);
   }, [sourcePreviewUrl]);
+  useEffect(() => {
+    if (!selectedBlockId) return;
+    document.getElementById(`ocr-block-${selectedBlockId}`)?.scrollIntoView?.({ block: 'center' });
+  }, [selectedBlockId, ocr.data]);
   useEffect(() => {
     if (!selectedRunId && extractionRuns.data?.items.length) setSelectedRunId(extractionRuns.data.items[0].id);
   }, [selectedRunId, extractionRuns.data]);
@@ -440,10 +591,10 @@ export function InvestigationUnavailable() {
     {documents.isLoading ? <LoadingPanel/> : documents.isError ? <QueryError onRetry={() => void documents.refetch()}/> : <section className="panel recent-panel"><div className="panel-head"><div><h2>Evidence inventory</h2><p>{inProgressCount ? `OCR is processing ${inProgressCount} document(s)${waitingCount ? ` · ${waitingCount} queued` : ''}. Status refreshes as work completes.` : 'Source metadata and integrity hashes are recorded for each upload.'}</p></div></div><div className="list-toolbar"><label className="auth-label">Search evidence<input value={documentSearch} onChange={(event) => setDocumentSearch(event.target.value)} placeholder="Filename, hash, or source"/></label><label className="auth-label">Processing status<select value={documentStatusFilter} onChange={(event) => setDocumentStatusFilter(event.target.value)}><option value="">All statuses</option>{[...new Set(documentItems.map((doc) => doc.processing_status))].sort().map((status) => <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>)}</select></label></div>{filteredDocuments.length ? <div className="table-wrap"><table className="dashboard-table"><thead><tr><th>FILE</th><th>SHA-256</th><th>SOURCE</th><th>SIZE</th><th>STATUS</th><th>ADDED</th><th/></tr></thead><tbody>{filteredDocuments.map((doc) => <tr key={doc.id}><td><button className="text-link" onClick={() => { setSelectedDocumentId(doc.id); setIncludeRaw(false); setSelectedRunId(''); }}>{doc.filename}</button></td><td><code>{doc.sha256 ? `${doc.sha256.slice(0, 12)}…` : 'Unavailable'}</code></td><td>{doc.source_description || 'Not recorded'}</td><td>{(doc.size_bytes / 1024 / 1024).toFixed(2)} MiB</td><td><StatusBadge value={doc.processing_status}/></td><td>{fmtDate(doc.created_at)}</td><td>{['failed', 'relationship_extraction_failed'].includes(doc.processing_status) && (doc.attempts_remaining > 0 ? <button className="text-link" onClick={() => void retryDocument(doc.id)}>Retry · {doc.attempts_remaining} left</button> : <span className="muted">No retries left</span>)}</td></tr>)}</tbody></table></div> : <p className="panel-foot">{documentItems.length ? 'No documents match these filters.' : 'No documents uploaded yet.'}</p>}</section>}
     {selectedDocument && <section className="panel recent-panel"><div className="panel-head"><div><h2>{selectedDocument.filename}</h2><p><StatusBadge value={selectedDocument.processing_status}/></p></div><button className="button secondary small" type="button" aria-expanded={showRunHistory} onClick={() => setShowRunHistory((value) => !value)}>{showRunHistory ? 'Hide extraction history' : 'Extraction history'}</button></div>
       {sourceFile.isError && <p className="notice" role="status">Original preview is unavailable. The OCR text and evidence references remain available.</p>}
-      {sourcePreviewUrl && selectedDocument.content_type === 'application/pdf' && <iframe className="evidence-source-frame" title={`Original source PDF: ${selectedDocument.filename}`} src={sourcePreviewUrl}/>}
+      {sourcePreviewUrl && selectedDocument.content_type === 'application/pdf' && visualRegion && sourcePagePreviewUrl ? <div className="evidence-pdf-region-preview"><div className="pdf-region-canvas"><img src={sourcePagePreviewUrl} alt={`Rendered source page ${visualPage} of ${selectedDocument.filename}`}/><div className="visual-evidence-region" style={{ left: `${visualRegion.x0 * 1.5}px`, top: `${visualRegion.y0 * 1.5}px`, width: `${(visualRegion.x1 - visualRegion.x0) * 1.5}px`, height: `${(visualRegion.y1 - visualRegion.y0) * 1.5}px` }}/></div><p>Source page {visualPage} · region highlighted in rendered source coordinates. The original PDF remains available below.</p><iframe className="evidence-source-frame" title={`Original source PDF: ${selectedDocument.filename}`} src={`${sourcePreviewUrl}#page=${visualPage}`}/></div> : sourcePreviewUrl && selectedDocument.content_type === 'application/pdf' && <iframe className="evidence-source-frame" title={`Original source PDF: ${selectedDocument.filename}`} src={`${sourcePreviewUrl}#page=${visualPage}`}/>}
       {sourcePreviewUrl && selectedDocument.content_type.startsWith('image/') && <div className="evidence-viewer">
         <div className="evidence-viewer-toolbar" role="group" aria-label="Source viewer controls"><button type="button" className="button secondary small" aria-label="Zoom out source" onClick={() => setViewerZoom((value) => Math.max(50, value - 10))}>−</button><span aria-live="polite">{viewerZoom}%</span><button type="button" className="button secondary small" aria-label="Zoom in source" onClick={() => setViewerZoom((value) => Math.min(200, value + 10))}>+</button><button type="button" className="button secondary small" onClick={() => setViewerZoom(100)}>Fit</button></div>
-        <div className="evidence-source-preview"><div className="evidence-source-page" style={{ width: `${viewerZoom}%` }}><img src={sourcePreviewUrl} alt={`Unmodified source document ${selectedDocument.filename}`}/>
+        <div className="evidence-source-preview"><div className="evidence-source-page" style={{ width: `${viewerZoom}%` }}><img src={sourcePreviewUrl} alt={`Unmodified source document ${selectedDocument.filename}`}/>{visualRegion && overlayPage && visualPage === 1 && <div className="visual-evidence-region" style={{ left: `${visualRegion.x0 / overlayPage.width * 100}%`, top: `${visualRegion.y0 / overlayPage.height * 100}%`, width: `${(visualRegion.x1 - visualRegion.x0) / overlayPage.width * 100}%`, height: `${(visualRegion.y1 - visualRegion.y0) / overlayPage.height * 100}%` }}/>}
           {overlayPage && displayedBlocks.map((block) => {
             const rect = boundingRect(block.engine_bbox);
             if (!rect || (block.page_index ?? 0) !== 0) return null;
@@ -456,7 +607,7 @@ export function InvestigationUnavailable() {
       {showRunHistory && <section className="panel" aria-label="OCR extraction history"><div className="panel-head"><div><h3>Versioned OCR extraction runs</h3><p>Each run retains its engine output and page/span references; older results are not overwritten.</p></div></div>{extractionRuns.isLoading ? <p role="status">Loading extraction runs…</p> : extractionRuns.isError ? <p role="alert">Extraction history could not be loaded.</p> : (extractionRuns.data?.items.length ?? 0) === 0 ? <p>No versioned extraction runs are available for this document yet.</p> : <><label className="auth-label">Compare with run<select aria-label="Select OCR run to inspect" value={selectedRunId || extractionRuns.data?.items[0]?.id || ''} onChange={(event) => setSelectedRunId(event.target.value)}>{extractionRuns.data?.items.map((run) => <option key={run.id} value={run.id}>Run {run.run_number} · {run.provider} {run.provider_version || ''} · {run.status}</option>)}</select></label><ul className="extraction-run-list">{extractionRuns.data?.items.map((run) => <li key={run.id}>Run {run.run_number} · {run.status} · {run.latency_ms == null ? 'duration unavailable' : `${run.latency_ms.toFixed(0)} ms`}{run.error_detail ? ` · ${run.error_detail}` : ''}</li>)}</ul>{extractionDetail.data && <div className="extraction-page-list"><h4>Run {extractionDetail.data.run_number} normalized pages and regions</h4>{extractionDetail.data.pages.map((page) => <article key={page.id}><b>Page {page.page_number}</b><small>{page.width && page.height ? `${page.width} × ${page.height}` : 'Page dimensions unavailable'}</small><pre>{page.text}</pre></article>)}</div>}</>}</section>}
       {['queued', 'processing', 'relationship_extraction_pending'].includes(selectedDocument.processing_status) && <p className="processing-help" role="status" aria-live="polite">{selectedDocument.processing_status === 'queued' ? 'Your upload is safe. The OCR worker will pick it up automatically as soon as it finishes the document ahead of it.' : selectedDocument.processing_status === 'processing' ? 'PaddleOCR is reading your image now. On the first run, OCR may take a few minutes while its models initialize.' : 'OCR is complete. Relationship analysis is now running automatically.'}</p>}
       {['failed', 'relationship_extraction_failed'].includes(selectedDocument.processing_status) && <p className="auth-error" role="alert">{documentStatus.data?.error ?? 'Processing failed. You can retry this document.'}</p>}
-      {ocrReady && (ocr.isLoading ? <LoadingPanel/> : ocr.isError ? <QueryError onRetry={() => void ocr.refetch()}/> : <><div className="panel-head"><div><h3>Recognized text</h3><p>{ocr.data?.provider} {ocr.data?.provider_version ? `v${ocr.data.provider_version}` : ''} · {ocr.data?.blocks.length ?? 0} source blocks</p></div><button className="button secondary small" onClick={() => setIncludeRaw((value) => !value)}>{includeRaw ? 'Hide raw engine output' : 'Show raw engine output'}</button></div><pre className="ocr-text">{ocr.data?.recognized_text || 'No text was recognized.'}</pre><label className="auth-label">Search OCR regions<input value={regionSearch} onChange={(event) => setRegionSearch(event.target.value)} placeholder="Search text or block ID"/></label><div className="ocr-block-list">{displayedBlocks.map((block) => <button type="button" className={`ocr-region-card ${selectedBlockId === block.block_id ? 'is-selected' : ''}`} key={block.block_id} onClick={() => setSelectedBlockId(block.block_id)}><b>{block.block_id}</b><small>{block.page_index == null ? block.source_path : `Page ${block.page_index + 1} · ${block.source_path}`}</small><p>{block.text}</p>{block.engine_bbox != null && <small>Bounds: {JSON.stringify(block.engine_bbox)}{block.engine_confidence == null ? '' : ` · engine confidence ${block.engine_confidence} (not calibrated accuracy)`}</small>}</button>)}</div>{includeRaw && <pre className="ocr-text">{JSON.stringify(ocr.data?.raw_result, null, 2)}</pre>}</>)}
+      {ocrReady && (ocr.isLoading ? <LoadingPanel/> : ocr.isError ? <QueryError onRetry={() => void ocr.refetch()}/> : <><div className="panel-head"><div><h3>Recognized text</h3><p>{ocr.data?.provider} {ocr.data?.provider_version ? `v${ocr.data.provider_version}` : ''} · {ocr.data?.blocks.length ?? 0} source blocks</p></div><button className="button secondary small" onClick={() => setIncludeRaw((value) => !value)}>{includeRaw ? 'Hide raw engine output' : 'Show raw engine output'}</button></div><pre className="ocr-text">{ocr.data?.recognized_text || 'No text was recognized.'}</pre><label className="auth-label">Search OCR regions<input value={regionSearch} onChange={(event) => setRegionSearch(event.target.value)} placeholder="Search text or block ID"/></label><div className="ocr-block-list">{displayedBlocks.map((block) => <button id={`ocr-block-${block.block_id}`} type="button" className={`ocr-region-card ${selectedBlockId === block.block_id ? 'is-selected' : ''}`} key={block.block_id} onClick={() => setSelectedBlockId(block.block_id)}><b>{block.block_id}</b><small>{block.page_index == null ? block.source_path : `Page ${block.page_index + 1} · ${block.source_path}`}</small><p>{block.text}</p>{block.engine_bbox != null && <small>Bounds: {JSON.stringify(block.engine_bbox)}{block.engine_confidence == null ? '' : ` · engine confidence ${block.engine_confidence} (not calibrated accuracy)`}</small>}</button>)}</div>{includeRaw && <pre className="ocr-text">{JSON.stringify(ocr.data?.raw_result, null, 2)}</pre>}</>)}
     </section>}
     <div className="dashboard-boundary"><ShieldCheck size={14}/><span>OCR output preserves the engine JSON and source block references. Relationship claims are descriptive and cite their source blocks.</span></div>
   </section>;

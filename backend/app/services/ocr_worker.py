@@ -276,6 +276,15 @@ async def process_one() -> bool:
         db.add(extraction_run)
         await db.flush()
         extraction_run_id = extraction_run.id
+        await append_audit(
+            db,
+            investigation_id=doc.investigation_id,
+            actor_user_id=None,
+            action="extraction.started",
+            target_type="extraction_run",
+            target_id=str(extraction_run.id),
+            details={"document_id": str(doc.id), "run_number": run_number},
+        )
         print(f"Claimed document {doc.id} for OCR (attempt {doc.processing_attempts}/3)", flush=True)
         await db.commit()
         storage_key = doc.storage_key
@@ -394,6 +403,15 @@ async def process_one() -> bool:
                 current.processing_status = "relationship_extraction_completed"
                 current.processing_error = None
                 current.processing_completed_at = datetime.now(timezone.utc)
+                await append_audit(
+                    db,
+                    investigation_id=current.investigation_id,
+                    actor_user_id=None,
+                    action="relationship_extraction.completed",
+                    target_type="document",
+                    target_id=str(current.id),
+                    details={"model": settings.xai_model},
+                )
                 await db.commit()
         print(f"Relationship extraction completed for document {doc_id}", flush=True)
     except Exception as exc:
@@ -403,6 +421,15 @@ async def process_one() -> bool:
                 current.processing_status = "relationship_extraction_failed"
                 current.processing_error = str(exc)[:500]
                 current.processing_completed_at = datetime.now(timezone.utc)
+                await append_audit(
+                    db,
+                    investigation_id=current.investigation_id,
+                    actor_user_id=None,
+                    action="relationship_extraction.failed",
+                    target_type="document",
+                    target_id=str(current.id),
+                    details={"error": str(exc)[:300]},
+                )
                 await db.commit()
         print(f"Document {doc_id} relationship extraction failed: {str(exc)[:300]}", flush=True)
     return True

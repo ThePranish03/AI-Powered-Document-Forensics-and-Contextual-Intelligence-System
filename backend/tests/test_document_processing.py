@@ -8,7 +8,7 @@ from app.api.v1 import analysis as analysis_routes, auth as auth_routes, investi
 from app.core.config import settings
 from app.main import app
 from app.services.ocr_worker import _blocks
-from app.services import ocr_worker
+from app.services import ocr_worker, relationship_extraction
 from app.services.relationship_extraction import EntityMention
 from pydantic import ValidationError
 from scripts import paddle_service
@@ -108,6 +108,7 @@ async def test_worker_persists_immutable_extraction_run_pages_and_spans(client, 
     monkeypatch.setattr(investigation_routes, "settings", replace(settings, document_storage_path=str(tmp_path)))
     monkeypatch.setattr(ocr_worker, "settings", replace(settings, document_storage_path=str(tmp_path)))
     monkeypatch.setattr(ocr_worker, "SessionLocal", app.state.test_sessions)
+    monkeypatch.setattr(relationship_extraction, "extract", lambda _blocks: ({"schema_version": "relationship_extraction_v1", "entities": [], "relationships": []}, {"usage": []}))
     monkeypatch.setattr(
         ocr_worker,
         "_run_engine",
@@ -142,7 +143,8 @@ async def test_worker_persists_immutable_extraction_run_pages_and_spans(client, 
     assert span["block_id"] == "block_000001"
     assert span["bounding_box"] == [3, 5, 120, 25]
     assert span["confidence"] == 0.94
-    assert (await client.get(f"/api/v1/investigations/{case.json()['id']}/audit")).json()["items"][-1]["action"] == "extraction.completed"
+    audit_actions = [item["action"] for item in (await client.get(f"/api/v1/investigations/{case.json()['id']}/audit")).json()["items"]]
+    assert audit_actions[-2:] == ["extraction.completed", "relationship_extraction.completed"]
     auth_routes._attempts.clear()
 
 

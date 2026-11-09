@@ -62,7 +62,7 @@ def load_settings() -> Settings:
         document_storage_path=os.getenv("DOCUMENT_STORAGE_PATH", "./private_uploads"),
         xai_api_key=os.getenv("XAI_API_KEY", ""),
         xai_base_url=os.getenv("XAI_BASE_URL", "https://api.x.ai/v1").rstrip("/"),
-        xai_model=os.getenv("XAI_MODEL", "grok-4.7"),
+        xai_model=os.getenv("XAI_MODEL", "xai/grok-4.7"),
         relationship_extraction_enabled=os.getenv("RELATIONSHIP_EXTRACTION_ENABLED", "false").lower() == "true",
     )
 

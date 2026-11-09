@@ -217,6 +217,22 @@ class Finding(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class VisualAnalysisRun(Base):
+    __tablename__ = "visual_analysis_runs"
+    __table_args__ = (Index("ix_visual_runs_document_created", "document_id", "created_at"),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    analyzer_version: Mapped[str] = mapped_column(String(32), default="1")
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TimelineEvent(Base):
     __tablename__ = "timeline_events"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -252,11 +268,13 @@ class DerivedGraphNode(Base):
 
 class DossierSnapshot(Base):
     __tablename__ = "dossier_snapshots"
+    __table_args__ = (Index("uq_dossier_snapshot_investigation_version", "investigation_id", "version", unique=True),)
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
     version: Mapped[int] = mapped_column(Integer)
     snapshot: Mapped[dict] = mapped_column(JSON)
     html: Mapped[str] = mapped_column(Text)
+    content_sha256: Mapped[str] = mapped_column(String(64))
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

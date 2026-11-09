@@ -40,7 +40,7 @@ describe('DocForensIQ authentication and workspace', () => {
   it('shows the public landing page to signed-out visitors', async () => {
     mockFetch(() => jsonResponse(401, { detail: 'Authentication required' }));
     renderAt('/');
-    expect(await screen.findByRole('heading', { name: /ai-powered document forensics/i })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: /beyond ocr/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /start investigation/i })).toHaveAttribute('href', '/investigations/new');
     expect(screen.getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/login');
     expect(screen.getByRole('img', { name: /evidence viewer preview/i })).toBeInTheDocument();
@@ -74,13 +74,17 @@ describe('DocForensIQ authentication and workspace', () => {
     renderAt('/');
     expect(await screen.findByRole('heading', { name: /good to have you back, avery/i })).toBeInTheDocument();
     expect(await screen.findByRole('heading', { name: /your workspace is ready/i })).toBeInTheDocument();
-    expect(screen.getAllByText('0', { selector: 'strong' })).toHaveLength(4);
+    expect(screen.getByText('0', { selector: 'strong' })).toBeInTheDocument();
+    expect(screen.getAllByText('—', { selector: 'strong' })).toHaveLength(3);
+    expect(screen.getByRole('heading', { name: /beyond ocr.*evidence-led document intelligence/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /visual forensics/i })).toHaveAttribute('href', '/investigations/new');
   });
 
   it('redirects successful login to the originally requested protected route', async () => {
     mockFetch((url, method) => {
       if (url.endsWith('/auth/login') && method === 'POST') return jsonResponse(200, user);
       if (url.includes('/investigations?')) return jsonResponse(200, { items: [], offset: 0, limit: 100 });
+      if (url.includes('/dashboard/recent-investigations')) return jsonResponse(200, []);
       return jsonResponse(401, { detail: 'Authentication required' });
     });
     renderAt('/investigations');

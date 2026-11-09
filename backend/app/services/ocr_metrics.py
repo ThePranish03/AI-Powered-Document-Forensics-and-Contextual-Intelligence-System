@@ -243,19 +243,49 @@ def evaluate_samples(samples: list[dict], iou_threshold: float = 0.5) -> dict[st
     }
 
 
-_AMOUNT = r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})|[0-9]+\.[0-9]{2})"
+_AMOUNT = r"((?:[0-9Oo]{1,3}(?:,[0-9Oo]{3})+|[0-9Oo]+)(?:\.[0-9Oo]{1,2})?)(?=\s|[.;:)\]\n]|(?:tax|gst|vat|invoice|payment|settlement|to|and)\b|$)"
+_CURRENCY = r"(?:INR|USD|EUR|Rs\.?|₹|\$|€|[^\w\s0-9.,-]+)?\s*"
 _LABELS = (
-    ("subtotal", re.compile(rf"(?i)\bsub[\s-]*total\b\s*[:\-]?\s*(?:INR|USD|EUR|Rs\.?|₹|\$|€)?\s*{_AMOUNT}")),
-    ("tax", re.compile(rf"(?i)\b(?:tax|gst|vat)\b\s*[:\-]?\s*(?:INR|USD|EUR|Rs\.?|₹|\$|€)?\s*{_AMOUNT}")),
-    ("total", re.compile(rf"(?i)\b(?:grand\s+total|total\s+amount|amount\s+due|total)\b\s*[:\-]?\s*(?:INR|USD|EUR|Rs\.?|₹|\$|€)?\s*{_AMOUNT}")),
+    ("subtotal", re.compile(rf"(?i)\bsub[\s-]*total\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+    ("tax", re.compile(rf"(?i)(?<![A-Za-z])(?:tax|gst|vat)\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+    ("total", re.compile(rf"(?i)\b(?:grand\s+total|total\s+amount|amount\s+due|total)\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+    ("purchase_order_value", re.compile(rf"(?i)\b(?:approved\s+)?purchase\s+order\s+value\b\s*(?:is\s*)?[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+    ("invoice_amount", re.compile(rf"(?i)\binvoice\s+(?:amount|of)\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+    ("payment", re.compile(rf"(?i)\b(?:payment\s+of|payment\s+amount|paid)\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+    ("settlement", re.compile(rf"(?i)\bsettlement(?:\s+of|\s+amount)?\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
 )
-_IDENTIFIER = re.compile(r"(?i)\b(?P<label>invoice|inv|purchase\s*order|po|transaction|txn|account|reference|ref)(?:\s*(?:no|number|id|#))?\s*[:#\-]?\s*(?P<value>[A-Z0-9][A-Z0-9\-]{4,})")
+_IDENTIFIER = re.compile(r"(?i)\b(?P<label>purchase\s*order|invoice|transaction|reference|account|vendor)(?![a-z])(?:\s*(?:no|number|id|#))?\s*[:#\-]?\s*(?P<value>[A-Z0-9][A-Z0-9\-]{2,})")
+_PREFIXED_IDENTIFIER = re.compile(r"(?i)\b(?P<prefix>INV|PO|TXN|REF)-(?P<suffix>[A-Z0-9][A-Z0-9\-]{2,})\b")
+_IDENTIFIER_STOP_WORDS = {"total", "subtotal", "approval", "value", "should", "reference", "holder", "matching", "amount", "invoice", "order", "date", "ledger"}
 _ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _SLASH_DATE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+_MONTH_DATE = re.compile(r"(?i)\b(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?P<year>\d{4})(?!\d)")
+_MONTHS = {name.lower(): index for index, names in enumerate((
+    ("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+    ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+    ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"), ("dec", "december"),
+), start=1) for name in names}
+_OBSERVED_FIELD_PATTERNS = (
+    ("organization", re.compile(r"(?i)\b(?:company|employer|supplier|vendor|bill\s+to)\s*[:\-]\s*([^|\n]+)")),
+    ("account_holder", re.compile(r"(?i)\baccount\s+holder\s*[:\-]\s*([^|\n]+)")),
+    ("vendor_id", re.compile(r"(?i)\bvendor\s+id\s*[:#\-]?\s*([^|\n]+)")),
+    ("person_name", re.compile(r"(?i)\b(?:employee\s+name|employee|name)\s*[:\-]\s*([^|\n]+)")),
+    ("address", re.compile(r"(?i)\baddress\s*[:\-]\s*([^|\n]+)")),
+    ("account_number", re.compile(r"(?i)\b(?:bank\s+account|account\s*(?:no|number|#))\s*[:#\-]?\s*([0-9][0-9 -]{3,})")),
+    ("salary", re.compile(r"(?i)\b(?:gross\s+salary|net\s+salary|salary|gross\s+pay|net\s+pay)\s*[:\-]?\s*([^\s|]+)")),
+    ("date", re.compile(r"(?i)\b(?:invoice\s+date|date|statement\s+period|period)\s*[:\-]\s*([^|\n]+)")),
+)
 
 
-def _money(value: str) -> float:
-    return float(value.replace(",", ""))
+def _money(value: str) -> tuple[float, list[str]]:
+    normalized = value.replace(",", "")
+    warnings: list[str] = []
+    if re.fullmatch(r"[0-9Oo]+(?:\.[0-9Oo]{1,2})?", normalized):
+        if re.search(r"[Oo]", normalized):
+            normalized = re.sub(r"[Oo]", "0", normalized)
+            warnings.append("OCR letter O was interpreted as zero; verify the original page.")
+        return float(normalized), warnings
+    raise ValueError("Amount contains unsupported characters")
 
 
 def _valid_date(year: int, month: int, day: int) -> bool:
@@ -274,6 +304,8 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
     identifiers = []
     dates = []
     labeled: dict[str, dict[str, Any]] = {}
+    financial_amounts: list[dict[str, Any]] = []
+    observed_fields: list[dict[str, Any]] = []
     seen_identifiers: set[tuple[str, str]] = set()
     for block in blocks:
         text = str(block.get("text") or "")
@@ -282,18 +314,51 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
         block_id = block.get("block_id")
         page = block.get("page_index")
         for label, pattern in _LABELS:
-            if label in labeled:
-                continue
             match = pattern.search(text)
             if match:
-                labeled[label] = {"value": _money(match.group(1)), "raw": match.group(1), "block_id": block_id, "page_index": page, "text": text}
+                try:
+                    amount_value, warnings = _money(match.group(1))
+                except ValueError:
+                    continue
+                field = {
+                    "field_type": label,
+                    "value": amount_value,
+                    "raw": match.group(1),
+                    "normalization_warnings": warnings,
+                    "block_id": block_id,
+                    "page_index": page,
+                    "text": text,
+                }
+                financial_amounts.append(field)
+                labeled.setdefault(label, field)
+        for field_type, pattern in _OBSERVED_FIELD_PATTERNS:
+            for match in pattern.finditer(text):
+                observed_fields.append({
+                    "field_type": field_type,
+                    "raw": match.group(1).strip(),
+                    "block_id": block_id,
+                    "page_index": page,
+                    "text": text,
+                })
         for match in _IDENTIFIER.finditer(text):
             value = match.group("value").upper()
+            if value.rstrip("-").casefold() in _IDENTIFIER_STOP_WORDS:
+                continue
             label = re.sub(r"\s+", " ", match.group("label").casefold())
             entity_type = ("INVOICE" if label in {"invoice", "inv"} else
                            "PURCHASE_ORDER" if label in {"purchase order", "po"} else
                            "TRANSACTION" if label in {"transaction", "txn"} else
-                           "ACCOUNT" if label == "account" else "REFERENCE")
+                           "ACCOUNT" if label == "account" else
+                           "VENDOR" if label == "vendor" else "REFERENCE")
+            key = (entity_type, value)
+            if key in seen_identifiers:
+                continue
+            seen_identifiers.add(key)
+            identifiers.append({"value": value, "entity_type": entity_type, "block_id": block_id, "page_index": page, "text": text})
+        for match in _PREFIXED_IDENTIFIER.finditer(text):
+            prefix = match.group("prefix").upper()
+            value = f"{prefix}-{match.group('suffix').upper()}"
+            entity_type = {"INV": "INVOICE", "PO": "PURCHASE_ORDER", "TXN": "TRANSACTION", "REF": "REFERENCE"}[prefix]
             key = (entity_type, value)
             if key in seen_identifiers:
                 continue
@@ -302,6 +367,11 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
         for match in _ISO_DATE.finditer(text):
             year, month, day = (int(match.group(i)) for i in (1, 2, 3))
             if _valid_date(year, month, day):
+                dates.append({"raw": match.group(0), "interpreted": f"{year:04d}-{month:02d}-{day:02d}", "ambiguous": False, "block_id": block_id, "page_index": page, "text": text})
+        for match in _MONTH_DATE.finditer(text):
+            year, day = int(match.group("year")), int(match.group("day"))
+            month = _MONTHS.get(match.group("month").casefold())
+            if month and _valid_date(year, month, day):
                 dates.append({"raw": match.group(0), "interpreted": f"{year:04d}-{month:02d}-{day:02d}", "ambiguous": False, "block_id": block_id, "page_index": page, "text": text})
         for match in _SLASH_DATE.finditer(text):
             first, second, year_raw = int(match.group(1)), int(match.group(2)), int(match.group(3))
@@ -325,8 +395,12 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
         "text": text,
         "identifiers": identifiers,
         "labeled_amounts": labeled,
+        "financial_amounts": financial_amounts,
+        "observed_fields": observed_fields,
         "dates": dates,
         "quality": quality,
+        "structured_entities": (document.get("structured_extraction") or {}).get("entities", []),
+        "structured_relationships": (document.get("structured_extraction") or {}).get("relationships", []),
         "empty": not text.strip(),
     }
 
@@ -340,6 +414,209 @@ def _ref(document: dict, **extra: Any) -> dict[str, Any]:
         "source_sha256": document.get("sha256"),
         "page_number": page_number,
         **extra,
+    }
+
+
+def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], timeline: list[dict], by_hash: dict, by_identifier: dict) -> dict[str, Any]:
+    finding_counts: dict[str, int] = {}
+    for finding in findings:
+        kind = finding["finding_type"]
+        finding_counts[kind] = finding_counts.get(kind, 0) + 1
+
+    def rule(rule_id: str, description: str, inspected: list[str], matched: int, comparisons: list[dict], skipped: list[dict]) -> dict[str, Any]:
+        return {
+            "rule_id": rule_id,
+            "description": description,
+            "executed": True,
+            "documents_inspected": inspected,
+            "fields_extracted": [],
+            "comparisons_performed": comparisons,
+            "rules_matched": matched,
+            "rules_skipped": skipped,
+        }
+
+    inspected = [fact["document_id"] for fact in facts]
+    reconciliation_comparisons = []
+    reconciliation_skipped = []
+    for fact in facts:
+        amounts = fact["labeled_amounts"]
+        required = ("subtotal", "tax", "total")
+        missing = [label for label in required if label not in amounts]
+        if missing:
+            reconciliation_skipped.append({
+                "document_id": fact["document_id"],
+                "reason": "required_labeled_amounts_missing",
+                "missing_fields": missing,
+            })
+        else:
+            expected = amounts["subtotal"]["value"] + amounts["tax"]["value"]
+            observed = amounts["total"]["value"]
+            reconciliation_comparisons.append({
+                "document_id": fact["document_id"],
+                "fields": {label: {"raw": amounts[label]["raw"], "normalized": amounts[label]["value"]} for label in required},
+                "expected_total": round(expected, 2),
+                "observed_total": round(observed, 2),
+                "difference": round(observed - expected, 2),
+                "matched": abs(expected - observed) > 0.02,
+            })
+
+    extraction_skipped = [
+        {"document_id": fact["document_id"], "reason": "recognized_text_present"}
+        for fact in facts if not (fact["empty"] and fact.get("provider"))
+    ]
+    confidence_skipped = []
+    confidence_comparisons = []
+    for fact in facts:
+        quality = fact["quality"]
+        if quality["status"] != "computed":
+            confidence_skipped.append({"document_id": fact["document_id"], "reason": "engine_confidence_unavailable"})
+        elif not quality["low_confidence_block_ids"]:
+            confidence_skipped.append({"document_id": fact["document_id"], "reason": "no_block_below_threshold", "threshold": quality["threshold"]})
+        else:
+            confidence_comparisons.append({
+                "document_id": fact["document_id"],
+                "threshold": quality["threshold"],
+                "low_confidence_block_ids": quality["low_confidence_block_ids"],
+            })
+
+    duplicate_comparisons = []
+    duplicate_skipped = []
+    for digest, group in by_hash.items():
+        comparison = {
+            "sha256": digest,
+            "document_ids": [fact["document_id"] for fact in group],
+            "matched": len(group) > 1,
+        }
+        if len(group) > 1:
+            duplicate_comparisons.append(comparison)
+        else:
+            duplicate_skipped.append({"document_id": group[0]["document_id"], "reason": "no_other_document_has_same_sha256"})
+    docs_with_hash = {fact["document_id"] for fact in facts if fact["sha256"]}
+    duplicate_skipped.extend(
+        {"document_id": fact["document_id"], "reason": "sha256_unavailable"}
+        for fact in facts if fact["document_id"] not in docs_with_hash
+    )
+
+    cross_comparisons = []
+    cross_skipped = []
+    for (entity_type, value), occurrences in by_identifier.items():
+        distinct_docs: dict[str, tuple[dict, dict]] = {}
+        for fact, identifier in occurrences:
+            distinct_docs.setdefault(fact["document_id"], (fact, identifier))
+        if len(distinct_docs) < 2:
+            continue
+        if entity_type not in {"INVOICE", "PURCHASE_ORDER", "TRANSACTION", "REFERENCE"}:
+            cross_skipped.append({
+                "identifier_type": entity_type,
+                "identifier": value,
+                "document_ids": list(distinct_docs),
+                "reason": "identifier_type_not_used_to_compare_transaction_totals",
+            })
+            continue
+        available = []
+        missing_total_docs = []
+        for fact, identifier in distinct_docs.values():
+            total = fact["labeled_amounts"].get("total")
+            if total is None:
+                missing_total_docs.append(fact["document_id"])
+            else:
+                available.append({
+                    "document_id": fact["document_id"],
+                    "filename": fact["filename"],
+                    "raw": total["raw"],
+                    "normalized": total["value"],
+                    "normalization_warnings": total.get("normalization_warnings", []),
+                    "block_id": total["block_id"],
+                    "page_index": total["page_index"],
+                    "identifier_block_id": identifier["block_id"],
+                })
+        if len(available) < 2:
+            cross_skipped.append({
+                "identifier_type": entity_type,
+                "identifier": value,
+                "document_ids": list(distinct_docs),
+                "reason": "fewer_than_two_documents_have_labeled_totals",
+                "documents_without_total": missing_total_docs,
+            })
+            continue
+        normalized_values = sorted({round(item["normalized"], 2) for item in available})
+        cross_comparisons.append({
+            "identifier_type": entity_type,
+            "identifier": value,
+            "documents": available,
+            "documents_without_total": missing_total_docs,
+            "distinct_normalized_totals": normalized_values,
+            "matched": len(normalized_values) > 1,
+        })
+        if len(normalized_values) == 1:
+            cross_skipped.append({
+                "identifier_type": entity_type,
+                "identifier": value,
+                "document_ids": [item["document_id"] for item in available],
+                "reason": "labeled_totals_equal",
+            })
+
+    date_skipped = [
+        {"document_id": fact["document_id"], "reason": "no_supported_date_string"}
+        for fact in facts if not fact["dates"]
+    ]
+    diagnostic_rules = [
+        rule("subtotal_plus_tax_vs_total", "Requires subtotal, tax, and total from the same document; flags an absolute difference greater than 0.02.", inspected, finding_counts.get("reconciliation", 0), reconciliation_comparisons, reconciliation_skipped),
+        rule("empty_ocr_text", "Requires an OCR provider and empty recognized text.", inspected, finding_counts.get("extraction_gap", 0), [], extraction_skipped),
+        rule("low_confidence_regions", "Requires engine confidence scores and at least one block below 0.55.", inspected, finding_counts.get("ocr_quality", 0), confidence_comparisons, confidence_skipped),
+        rule("duplicate_file_bytes", "Requires the same recorded SHA-256 on at least two documents.", inspected, finding_counts.get("duplicate_bytes", 0), duplicate_comparisons, duplicate_skipped),
+        rule("shared_identifier_total_conflict", "Requires the same typed identifier in at least two documents, at least two parsed labeled totals, and unequal normalized values.", inspected, finding_counts.get("identifier_amount_conflict", 0), cross_comparisons, cross_skipped),
+        rule("date_extraction", "Extracts valid ISO, slash-form, and named-month dates into timeline events; this rule does not create findings.", inspected, len(timeline), [], date_skipped),
+    ]
+    diagnostic_fields = {
+        "subtotal_plus_tax_vs_total": lambda fact: [item for item in fact["financial_amounts"] if item["field_type"] in {"subtotal", "tax", "total"}],
+        "empty_ocr_text": lambda fact: [{"recognized_text_characters": len(fact["text"]), "provider_present": bool(fact.get("provider"))}],
+        "low_confidence_regions": lambda fact: [fact["quality"]],
+        "duplicate_file_bytes": lambda fact: [{"sha256": fact.get("sha256")}],
+        "shared_identifier_total_conflict": lambda fact: [{"identifiers": fact["identifiers"], "labeled_total": fact["labeled_amounts"].get("total")}],
+        "date_extraction": lambda fact: fact["dates"],
+    }
+    for item in diagnostic_rules:
+        item["fields_extracted"] = [{
+            "document_id": fact["document_id"],
+            "fields": diagnostic_fields[item["rule_id"]](fact),
+        } for fact in facts]
+    return {
+        "summary": {
+            "documents_inspected": len(facts),
+            "findings_produced": len(findings),
+            "timeline_events_produced": len(timeline),
+            "graph_nodes_produced": len(by_identifier),
+            "findings_by_type": finding_counts,
+        },
+        "data_flow": {
+            "source": "documents joined to latest OCRResult by document_id; stored OCR blocks supply text, block_id, page_index, confidence, and bbox references",
+            "structured_extraction_used_for_findings": False,
+            "structured_extraction_note": "Persisted relationship extraction is not consumed by these deterministic evidence rules; its grounded entities are reported per document for diagnosis only.",
+        },
+        "documents": [{
+            "document_id": fact["document_id"],
+            "filename": fact["filename"],
+            "ocr_text_characters": len(fact["text"]),
+            "identifiers_extracted": fact["identifiers"],
+            "financial_fields_extracted": [{
+                "field_type": item["field_type"],
+                "raw": item["raw"],
+                "normalized": item["value"],
+                "normalization_warnings": item.get("normalization_warnings", []),
+                "block_id": item["block_id"],
+                "page_number": item["page_index"] + 1 if isinstance(item.get("page_index"), int) else item.get("page_index"),
+            } for item in fact["financial_amounts"]],
+            "observed_labeled_fields": fact["observed_fields"],
+            "dates_extracted": fact["dates"],
+            "ocr_quality": fact["quality"],
+            "structured_entities": [{
+                "entity_type": item.get("entity_type"),
+                "mention_text": item.get("mention_text"),
+                "source_block_ids": item.get("source_block_ids", []),
+            } for item in fact["structured_entities"] if isinstance(item, dict)],
+        } for fact in facts],
+        "rules": diagnostic_rules,
     }
 
 
@@ -438,6 +715,8 @@ def analyze_documents(documents: list[dict]) -> dict[str, Any]:
             "resolution": "identifier_match" if len(docs) > 1 else "candidate",
             "basis": "Explicit identifier text matched after case-folding. A single occurrence stays a candidate link, not a confirmed party.",
         }
+        if entity_type not in {"INVOICE", "PURCHASE_ORDER", "TRANSACTION", "REFERENCE"}:
+            continue
         totals = []
         for fact, identifier in occurrences:
             total = fact["labeled_amounts"].get("total")
@@ -445,18 +724,28 @@ def analyze_documents(documents: list[dict]) -> dict[str, Any]:
                 totals.append((fact, identifier, total))
         distinct = {round(item[2]["value"], 2) for item in totals}
         if len(docs) > 1 and len(distinct) > 1:
+            normalized_totals = [
+                f"{fact['filename']}: {total['raw']} => {total['value']:.2f}"
+                + (" (OCR-confusable character normalization)" if total.get("normalization_warnings") else "")
+                for fact, _identifier, total in totals
+            ]
             findings.append({
                 "finding_type": "identifier_amount_conflict",
                 "title": f"Identifier {value} has conflicting labeled totals",
-                "description": "The same identifier is paired with different labeled totals. This is a conflict to review, not proof that either document is false.",
-                "severity": "high",
-                "confidence": 0.7,
+                "description": "The same typed identifier is paired with different OCR-extracted labeled totals: " + "; ".join(normalized_totals) + ". This is a candidate discrepancy to review, not proof that either document is false.",
+                "severity": "medium" if any(total.get("normalization_warnings") for _, _, total in totals) else "high",
+                "confidence": 0.45 if any(total.get("normalization_warnings") for _, _, total in totals) else 0.7,
                 "method": "shared_identifier_total_conflict",
                 "fingerprint": f"conflict:{value}",
-                "evidence_refs": [_ref(fact, block_id=identifier["block_id"], page_index=identifier["page_index"], quoted_text=identifier["text"], field_type="identifier") | {"related_total": total["raw"]} for fact, identifier, total in totals],
-                "limitations": limitation + " The identifier match is textual. It does not prove the documents describe one transaction.",
+                "evidence_refs": [
+                    _ref(fact, block_id=total["block_id"], page_index=total["page_index"], quoted_text=total["text"], field_type="labeled_total")
+                    | {"identifier": value, "identifier_block_id": identifier["block_id"], "related_total": total["raw"], "normalized_total": total["value"], "normalization_warnings": total.get("normalization_warnings", [])}
+                    for fact, identifier, total in totals
+                ],
+                "limitations": limitation + " The identifier match is textual, and OCR-confusable characters were normalized only to surface a low-confidence candidate. Verify the unmodified source before comparing financial values.",
             })
-    return {"findings": findings, "timeline": timeline, "nodes": list(nodes.values()), "documents": facts}
+    diagnostics = _analysis_diagnostics(facts, findings, timeline, by_hash, by_identifier)
+    return {"findings": findings, "timeline": timeline, "nodes": list(nodes.values()), "documents": facts, "diagnostics": diagnostics}
 
 
 def build_cross_document_correlation(documents: list[dict]) -> dict[str, Any]:

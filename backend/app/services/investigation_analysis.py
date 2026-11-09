@@ -1,18 +1,24 @@
+from datetime import datetime, timezone
+import uuid
 from uuid import UUID
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import (
+    AuditChainEvent,
     DerivedGraphNode,
     Document,
     DossierSnapshot,
     Finding,
     OCRResult,
+    RelationshipAnalysis,
     TimelineEvent,
+    VisualAnalysisRun,
 )
-from app.services.audit_chain import append_audit
-from app.services.dossier_report import build_snapshot, render_html
+from app.services.audit_chain import append_audit, verify_audit_chain
+from app.services.dossier_narrative import generate_grounded_narrative
+from app.services.dossier_report import build_snapshot, render_html, snapshot_digest
 from app.services.ocr_metrics import analyze_documents, build_cross_document_correlation
 
 ANALYZER_NAME = "deterministic_evidence"
@@ -34,6 +40,7 @@ def _finding_dict(item: Finding) -> dict:
         "evidence_refs": item.evidence_refs,
         "limitations": item.limitations,
         "review_notes": item.review_notes,
+        "reviewed_by_user_id": str(item.reviewed_by_user_id) if item.reviewed_by_user_id else None,
         "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else None,
         "created_at": item.created_at.isoformat(),
     }
@@ -57,12 +64,13 @@ def _timeline_dict(item: TimelineEvent) -> dict:
 
 async def run_investigation_analysis(db: AsyncSession, investigation, actor_id: UUID) -> dict:
     rows = (await db.execute(
-        select(Document, OCRResult)
+        select(Document, OCRResult, RelationshipAnalysis)
         .outerjoin(OCRResult, OCRResult.document_id == Document.id)
+        .outerjoin(RelationshipAnalysis, RelationshipAnalysis.document_id == Document.id)
         .where(Document.investigation_id == investigation.id)
     )).all()
     payloads = []
-    for document, result in rows:
+    for document, result, structured in rows:
         payloads.append({
             "document_id": str(document.id),
             "filename": document.filename,
@@ -72,6 +80,7 @@ async def run_investigation_analysis(db: AsyncSession, investigation, actor_id: 
             "blocks": result.blocks if result else [],
             "text": result.recognized_text if result else "",
             "processing_status": document.processing_status,
+            "structured_extraction": structured.payload if structured else None,
         })
     produced = analyze_documents(payloads)
     kept = (await db.scalars(select(Finding).where(
@@ -158,20 +167,23 @@ async def run_investigation_analysis(db: AsyncSession, investigation, actor_id: 
         details={"analyzer": ANALYZER_NAME, "analyzer_version": ANALYZER_VERSION, "candidate_findings_written": created, "documents_considered": len(payloads)},
     )
     await db.commit()
+    visual_runs = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation.id).order_by(VisualAnalysisRun.created_at.desc()))).all()
     return {
         "analyzer": ANALYZER_NAME,
         "analyzer_version": ANALYZER_VERSION,
         "documents_considered": len(payloads),
         "documents_with_ocr": sum(1 for item in payloads if item["text"] or item["blocks"]),
         "candidate_findings_written": created,
+        "diagnostics": produced["diagnostics"],
         "timeline_events_written": len(produced["timeline"]),
         "graph_nodes_written": len(produced["nodes"]),
         "visual_forensics": {
-            "status": "unavailable",
+            "status": "completed" if any(run.status == "completed" for run in visual_runs) else ("partial" if visual_runs else "not_run"),
+            "runs": [{"id": str(run.id), "document_id": str(run.document_id), "status": run.status, "observations_written": (run.result or {}).get("observations_written", 0)} for run in visual_runs],
+            "checks": [check for run in visual_runs for check in (run.result or {}).get("checks", [])],
             "available_signals": [],
             "related_non_visual_signals": ["duplicate file bytes", "empty OCR text", "low engine-confidence regions"],
-            "unavailable": ["font inconsistency", "copy-move detection", "compression anomaly", "forgery verdict"],
-            "reason": "Automated image-forensics checks are not implemented. Duplicate hashes and OCR quality are separate signals, not visual analysis.",
+            "reason": "Visual analysis runs on stored source bytes when requested for a document. No run means no visual result.",
         },
     }
 
@@ -187,6 +199,18 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
     findings = (await db.scalars(select(Finding).where(Finding.investigation_id == investigation.id))).all()
     timeline = (await db.scalars(select(TimelineEvent).where(TimelineEvent.investigation_id == investigation.id))).all()
     nodes = (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation.id))).all()
+    relationship_rows = (await db.execute(
+        select(RelationshipAnalysis, Document)
+        .join(Document, Document.id == RelationshipAnalysis.document_id)
+        .where(Document.investigation_id == investigation.id)
+        .order_by(Document.created_at, Document.id)
+    )).all()
+    audit_events = (await db.scalars(
+        select(AuditChainEvent)
+        .where(AuditChainEvent.investigation_id == investigation.id)
+        .order_by(AuditChainEvent.created_at, AuditChainEvent.id)
+    )).all()
+    visual_runs = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation.id).order_by(VisualAnalysisRun.created_at, VisualAnalysisRun.id))).all()
     version = (await db.scalar(select(func.max(DossierSnapshot.version)).where(DossierSnapshot.investigation_id == investigation.id)) or 0) + 1
     correlation = build_cross_document_correlation([{
         "document_id": str(document.id),
@@ -212,6 +236,8 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
             "title": investigation.title,
             "description": investigation.description,
             "status": investigation.status.value,
+            "created_at": investigation.created_at.isoformat(),
+            "updated_at": investigation.updated_at.isoformat(),
         },
         documents=[{
             "id": str(item.id),
@@ -220,7 +246,11 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
             "content_type": item.content_type,
             "size_bytes": item.size_bytes,
             "processing_status": item.processing_status,
-        } for item in documents],
+            "source_description": item.source_description,
+            "uploaded_at": item.created_at.isoformat(),
+            "extracted_text": (result.recognized_text if result else ""),
+            "extracted_blocks": (result.blocks if result else []),
+        } for item, result in document_rows],
         findings=[_finding_dict(item) for item in findings],
         timeline=[_timeline_dict(item) for item in timeline],
         nodes=[{
@@ -236,25 +266,85 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         } for item in nodes],
         correlations=correlation["links"],
         discrepancies=correlation["contradictions"],
+        audit_activity=[{
+            "id": str(item.id), "action": item.action, "target_type": item.target_type,
+            "target_id": item.target_id, "actor_user_id": str(item.actor_user_id) if item.actor_user_id else None,
+            "created_at": item.created_at.isoformat(), "details": item.details,
+            "previous_hash": item.previous_hash, "event_hash": item.event_hash,
+        } for item in audit_events],
+        document_relationships=[{"document_id": str(document.id), "filename": document.filename, "payload": record.payload, "model": record.model, "schema_version": record.schema_version, "created_at": record.created_at.isoformat()} for record, document in relationship_rows],
+        audit_verification=verify_audit_chain(audit_events),
+        visual_runs=[{"id": str(run.id), "document_id": str(run.document_id), "status": run.status, "analyzer_version": run.analyzer_version, "result": run.result, "created_at": run.created_at.isoformat(), "completed_at": run.completed_at.isoformat() if run.completed_at else None} for run in visual_runs],
     )
+    source_blocks = {
+        (str(document.id), str(block.get("block_id"))): block
+        for document, result in document_rows
+        for block in (result.blocks if result and isinstance(result.blocks, list) else [])
+        if isinstance(block, dict) and block.get("block_id")
+    }
+    def enrich_references(records: list[dict]) -> list[dict]:
+        for record in records:
+            for ref in record.get("evidence_refs", []):
+                block = source_blocks.get((str(ref.get("document_id", "")), str(ref.get("block_id", ""))))
+                if block:
+                    ref.setdefault("bounding_box", block.get("engine_bbox", block.get("bounding_box")))
+                    ref.setdefault("engine_confidence", block.get("engine_confidence"))
+        return records
+    snapshot["findings"] = enrich_references(snapshot["findings"])
+    snapshot["reviewed_findings"] = [item for item in snapshot["findings"] if item["status"] != "candidate"]
+    snapshot["timeline"] = enrich_references(snapshot["timeline"])
+    snapshot["cross_document_links"] = enrich_references(snapshot["cross_document_links"])
+    snapshot["cross_document_discrepancies"] = enrich_references(snapshot["cross_document_discrepancies"])
+    snapshot["ai_narrative"] = await generate_grounded_narrative(snapshot)
+    report_id = uuid.uuid4()
+    created_at = datetime.now(timezone.utc)
+    snapshot["report"] = {
+        "dossier_id": str(report_id), "version": version,
+        "created_at": created_at.isoformat(), "created_by_user_id": str(actor_id),
+        "integrity_algorithm": "sha256(snapshot-json + newline + html)",
+    }
     record = DossierSnapshot(
+        id=report_id,
         investigation_id=investigation.id,
         version=version,
         snapshot=snapshot,
         html=render_html(snapshot),
+        content_sha256="pending",
         created_by_user_id=actor_id,
+        created_at=created_at,
     )
+    record.content_sha256 = snapshot_digest(record.snapshot, record.html)
+    record.snapshot = {**record.snapshot, "report": {**record.snapshot["report"], "integrity_sha256": record.content_sha256}}
     db.add(record)
     await db.flush()
-    await append_audit(
+    dossier_event = await append_audit(
         db,
         investigation_id=investigation.id,
         actor_user_id=actor_id,
         action="dossier.created",
         target_type="dossier",
         target_id=str(record.id),
-        details={"version": version},
+        details={"version": version, "timestamp": datetime.now(timezone.utc).isoformat(), "actor_user_id": str(actor_id), "investigation_id": str(investigation.id)},
     )
+    record.snapshot = {
+        **record.snapshot,
+        "audit_activity": [*record.snapshot.get("audit_activity", []), {
+            "id": str(dossier_event.id),
+            "action": dossier_event.action,
+            "target_type": dossier_event.target_type,
+            "target_id": dossier_event.target_id,
+            "actor_user_id": str(dossier_event.actor_user_id) if dossier_event.actor_user_id else None,
+            "created_at": dossier_event.created_at.isoformat(),
+            "details": dossier_event.details,
+            "previous_hash": dossier_event.previous_hash,
+            "event_hash": dossier_event.event_hash,
+        }],
+    }
+    dossier_events = [*audit_events, dossier_event]
+    record.snapshot["audit_chain_verification"] = verify_audit_chain(dossier_events)
+    record.html = render_html(record.snapshot)
+    record.content_sha256 = snapshot_digest(record.snapshot, record.html)
+    record.snapshot = {**record.snapshot, "report": {**record.snapshot["report"], "integrity_sha256": record.content_sha256}}
     await db.commit()
     await db.refresh(record)
     return record

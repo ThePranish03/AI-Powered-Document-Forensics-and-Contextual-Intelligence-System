@@ -9,7 +9,7 @@ from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -115,6 +115,15 @@ async def create_investigation(payload: InvestigationCreate, request: Request, d
     db.add(item)
     await db.flush()
     db.add(ActivityEvent(actor_user_id=user.id, investigation_id=item.id, event_type="investigation.created", summary="Created investigation"))
+    await append_audit(
+        db,
+        investigation_id=item.id,
+        actor_user_id=user.id,
+        action="investigation.created",
+        target_type="investigation",
+        target_id=str(item.id),
+        details={"case_number": item.case_number},
+    )
     await db.commit()
     await db.refresh(item)
     return await as_response(db, item)
@@ -286,6 +295,36 @@ async def get_document_file(investigation_id: UUID, document_id: UUID, db: Async
     await db.commit()
     return FileResponse(path, media_type=doc.content_type, filename=doc.filename, content_disposition_type="inline",
                         headers={"X-Content-SHA256": computed_hash, "Cache-Control": "no-store"})
+
+
+@router.get("/{investigation_id}/documents/{document_id}/pages/{page_number}/preview")
+async def get_document_page_preview(investigation_id: UUID, document_id: UUID, page_number: int, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    doc = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
+    if doc is None or page_number < 1:
+        raise HTTPException(status_code=404, detail="Document page not found")
+    if doc.content_type != "application/pdf":
+        raise HTTPException(status_code=415, detail="Page previews are available for PDF sources")
+    path = stored_document_path(doc)
+    try:
+        import fitz
+        pdf = fitz.open(path)
+        try:
+            if page_number > pdf.page_count:
+                raise HTTPException(status_code=404, detail="Document page not found")
+            pix = pdf[page_number - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            image_bytes = pix.tobytes("png")
+        finally:
+            pdf.close()
+    except HTTPException:
+        raise
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="PDF page preview requires PyMuPDF") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="The requested PDF page could not be rendered") from exc
+    await append_audit(db, investigation_id=investigation_id, actor_user_id=user.id, action="evidence.page_previewed", target_type="document", target_id=str(doc.id), details={"page_number": page_number, "sha256": doc.sha256})
+    await db.commit()
+    return Response(image_bytes, media_type="image/png", headers={"Cache-Control": "no-store", "X-Source-Page": str(page_number)})
 
 
 @router.get("/{investigation_id}/documents/{document_id}/extraction-runs")

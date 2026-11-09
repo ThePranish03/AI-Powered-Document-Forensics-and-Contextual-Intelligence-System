@@ -7,16 +7,19 @@ const capabilities = [
     icon: FileSearch,
     title: 'Keep extracted details tied to their source',
     description: 'Move from a recognized value to the page and region it came from.',
+    href: '/investigations',
   },
   {
     icon: GitBranch,
     title: 'Compare records across a case',
     description: 'Review agreements and differences without losing document context.',
+    href: '/investigations',
   },
   {
     icon: FileImage,
     title: 'Inspect the original document',
     description: 'Keep visual review close to extracted text and investigator notes.',
+    href: '/investigations',
   },
 ];
 
@@ -48,13 +51,18 @@ export default function LandingPage() {
         <section className="marketing-hero" aria-labelledby="landing-title">
           <div className="marketing-hero-copy">
             <p className="marketing-kicker">Evidence-led document intelligence</p>
-            <h1 id="landing-title">AI-Powered<br />Document Forensics &<br /><span>Contextual Intelligence</span> Platform</h1>
+            <h1 id="landing-title">Beyond OCR.<br /><span>Evidence-led</span><br />document intelligence.</h1>
             <p className="marketing-lede">
-              Go beyond OCR. Investigate documents, detect inconsistencies, verify context, and prepare evidence-backed insights — with a human reviewer at every consequential step.
+              Investigate documents, surface inconsistencies, correlate evidence, and prepare explainable findings with human review at every consequential step.
             </p>
             <div className="marketing-hero-actions">
               <Link className="marketing-primary-link" to="/investigations/new">Start Investigation <ArrowRight size={17} /></Link>
               <a className="marketing-secondary-link" href="#workflow"><Play size={15} /> Explore the workflow</a>
+            </div>
+            <div className="marketing-proof" aria-label="Illustrative platform metrics">
+              <div><strong>05</strong><span>Synthetic documents</span></div>
+              <i aria-hidden="true"/><div><strong>04</strong><span>Illustrative findings</span></div>
+              <i aria-hidden="true"/><div><strong>100%</strong><span>Human review</span></div>
             </div>
           </div>
           <figure className="marketing-hero-visual">
@@ -85,12 +93,12 @@ export default function LandingPage() {
             <p>Move from extracted details to cross-document context without treating an automated result as a conclusion.</p>
           </div>
           <div className="marketing-capability-list">
-            {capabilities.map(({ icon: Icon, title, description }) => (
-              <article className="marketing-capability" key={title}>
+            {capabilities.map(({ icon: Icon, title, description, href }) => (
+              <Link className="marketing-capability" key={title} to={href}>
                 <span className="marketing-capability-icon"><Icon size={18} strokeWidth={1.7} /></span>
                 <div><h3>{title}</h3><p>{description}</p></div>
                 <ArrowUpRight className="marketing-capability-arrow" size={16} />
-              </article>
+              </Link>
             ))}
           </div>
         </section>

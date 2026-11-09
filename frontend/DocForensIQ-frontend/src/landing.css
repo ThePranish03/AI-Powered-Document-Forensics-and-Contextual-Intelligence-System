@@ -198,6 +198,17 @@
   transform: translateY(-2px);
 }
 
+.marketing-proof {
+  display: flex;
+  align-items: stretch;
+  gap: clamp(12px, 1.6vw, 22px);
+  margin-top: 30px;
+}
+.marketing-proof div { display: grid; gap: 5px; }
+.marketing-proof strong { color: #f0f5fb; font: 600 22px/1 var(--display); letter-spacing: -.04em; }
+.marketing-proof span { color: #8fa3b8; font: 8px/1.4 var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+.marketing-proof i { width: 1px; background: #25415b; }
+
 .marketing-secondary-link svg {
   display: block;
   padding: 3px;
@@ -320,6 +331,7 @@
   padding: 15px 2px;
   border-bottom: 1px solid var(--marketing-border);
 }
+.marketing-capability { color: inherit; text-decoration: none; }
 
 .marketing-capability-icon {
   width: 30px;
@@ -550,6 +562,10 @@
   .marketing-lede {
     font-size: 14px;
   }
+
+  .marketing-proof { gap: 12px; margin-top: 25px; }
+  .marketing-proof strong { font-size: 19px; }
+  .marketing-proof span { font-size: 7px; }
 
   .marketing-hero-visual {
     width: 100%;

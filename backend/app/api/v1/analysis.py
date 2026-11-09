@@ -1,21 +1,25 @@
 import asyncio
 import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, require_csrf, require_permission
 from app.api.v1.investigations import owned_investigation, stored_document_path
 from app.core.config import settings
-from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, TimelineEvent, User
+from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, EvidencePage, EvidenceSpan, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, TimelineEvent, User, VisualAnalysisRun
 from app.services.audit_chain import append_audit, verify_audit_chain
+from app.services.dossier_report import render_pdf, snapshot_digest
 from app.services.investigation_analysis import _finding_dict, _timeline_dict, create_dossier, run_investigation_analysis
 from app.services.ocr_metrics import build_cross_document_correlation, evaluate_samples
+from app.services.visual_forensics import analyze_file
 
 router = APIRouter()
 REVIEW_STATUSES = {"accepted", "rejected", "dismissed", "needs_review"}
@@ -109,7 +113,13 @@ def _dossier_summary(item: DossierSnapshot) -> dict:
         "created_at": item.created_at.isoformat(),
         "snapshot": item.snapshot,
         "html": item.html,
+        "content_sha256": item.content_sha256,
     }
+
+
+def _verify_dossier_integrity(record: DossierSnapshot) -> None:
+    if snapshot_digest(record.snapshot, record.html) != record.content_sha256:
+        raise HTTPException(status_code=409, detail="Stored dossier integrity verification failed")
 
 
 @router.post("/{investigation_id}/analysis-runs", status_code=201)
@@ -117,6 +127,110 @@ async def start_analysis(investigation_id: UUID, request: Request, db: AsyncSess
     require_csrf(request)
     investigation = await owned_investigation(db, user, investigation_id)
     return await run_investigation_analysis(db, investigation, user.id)
+
+
+def _visual_run_dict(run: VisualAnalysisRun) -> dict:
+    return {"id": str(run.id), "investigation_id": str(run.investigation_id), "document_id": str(run.document_id), "status": run.status, "analyzer_version": run.analyzer_version, "result": run.result or {}, "error_detail": run.error_detail, "created_at": run.created_at.isoformat(), "started_at": run.started_at.isoformat() if run.started_at else None, "completed_at": run.completed_at.isoformat() if run.completed_at else None}
+
+
+@router.post("/{investigation_id}/documents/{document_id}/visual-analysis-runs", status_code=201)
+async def run_visual_analysis(investigation_id: UUID, document_id: UUID, request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:update"))):
+    require_csrf(request)
+    await owned_investigation(db, user, investigation_id)
+    document = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = stored_document_path(document)
+    prior_run_count = await db.scalar(select(func.count(VisualAnalysisRun.id)).where(VisualAnalysisRun.investigation_id == investigation_id, VisualAnalysisRun.document_id == document_id))
+    run_kind = "retry" if prior_run_count else "new"
+    run = VisualAnalysisRun(investigation_id=investigation_id, document_id=document_id, status="processing", created_by_user_id=user.id, started_at=datetime.now(timezone.utc), result={"checks": [], "observations": []})
+    db.add(run)
+    await db.flush()
+    run.result = {"checks": [], "observations": [], "run_kind": run_kind}
+    await append_audit(db, investigation_id=investigation_id, actor_user_id=user.id, action="visual_analysis.started", target_type="visual_analysis_run", target_id=str(run.id), details={"document_id": str(document_id), "filename": document.filename, "run_kind": run_kind})
+    await db.commit()
+    try:
+        result = await asyncio.to_thread(analyze_file, path, str(document.id), document.content_type)
+        observations = result.get("observations", [])
+        spans = (await db.scalars(select(EvidenceSpan).where(EvidenceSpan.document_id == document.id))).all()
+        pages = (await db.scalars(select(EvidencePage).where(EvidencePage.document_id == document.id))).all()
+        page_by_num = {page.page_number: page for page in pages}
+        count = 0
+        for observation in observations:
+            page_no = observation.get("page_number")
+            region = observation.get("regions", [None])[0]
+            matched_span = None
+            if region:
+                for span in spans:
+                    if span.page_id != (page_by_num.get(page_no).id if page_by_num.get(page_no) else None):
+                        continue
+                    box = span.bounding_box or {}
+                    try:
+                        x0, y0, x1, y1 = (float(box[k]) for k in ("x0", "y0", "x1", "y1"))
+                        if x0 <= region["x1"] and x1 >= region["x0"] and y0 <= region["y1"] and y1 >= region["y0"]:
+                            matched_span = span
+                            break
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            evidence_refs = [{"document_id": str(document.id), "filename": document.filename, "source_sha256": document.sha256, "page_number": page_no, "page_id": str(page_by_num[page_no].id) if page_no in page_by_num else None, "block_id": matched_span.block_id if matched_span else observation.get("block_id"), "quoted_text": observation.get("quoted_text") or (matched_span.text[:500] if matched_span else None), "field_type": observation["check_type"], "bounding_box": region, "regions": observation.get("regions", []), "evidence_reference": f"document:{document.id}/page:{page_no}/visual"}]
+            raw = json.dumps({"document_id": str(document.id), "finding_type": observation["finding_type"], "page": page_no, "regions": observation.get("regions", []), "metrics": observation.get("metrics", {})}, sort_keys=True)
+            fingerprint = hashlib.sha256(raw.encode()).hexdigest()
+            finding = await db.scalar(select(Finding).where(Finding.investigation_id == investigation_id, Finding.fingerprint == fingerprint))
+            if finding is None:
+                finding = Finding(investigation_id=investigation_id, finding_type=observation["finding_type"], title=observation["finding_type"].replace("visual_", "").replace("_", " ").title(), description=observation["explanation"], severity="low", confidence=0.5, status="candidate", analyzer_name="visual_forensics", analyzer_version="1", method=observation["algorithm"], fingerprint=fingerprint, evidence_refs=evidence_refs, limitations=observation["limitations"])
+                db.add(finding)
+                await db.flush()
+            observation["finding_id"] = str(finding.id)
+            observation["investigation_id"] = str(investigation_id)
+            observation["document_id"] = str(document.id)
+            observation["evidence_ref"] = evidence_refs[0]
+            observation["review_status"] = finding.status
+            count += 1
+        unavailable_checks = [check["check_type"] for check in result.get("checks", []) if check.get("status") in {"unavailable", "partial", "failed"}]
+        run.status = "partial" if result.get("status") == "completed" and unavailable_checks else result.get("status", "completed")
+        run.result = {**result, "status": run.status, "run_kind": run_kind, "unavailable_checks": unavailable_checks, "observations_written": count}
+        run.completed_at = datetime.now(timezone.utc)
+        await append_audit(db, investigation_id=investigation_id, actor_user_id=user.id, action="visual_analysis.completed", target_type="visual_analysis_run", target_id=str(run.id), details={"document_id": str(document.id), "status": run.status, "observations_written": count, "checks_executed": [check["check_type"] for check in result.get("checks", []) if check.get("status") == "executed"], "checks_unavailable": unavailable_checks})
+        await db.commit()
+        await db.refresh(run)
+        return _visual_run_dict(run)
+    except Exception as exc:
+        await db.rollback()
+        run = await db.get(VisualAnalysisRun, run.id)
+        if run:
+            run.status = "failed"
+            run.error_detail = str(exc)[:2000]
+            run.completed_at = datetime.now(timezone.utc)
+            await append_audit(db, investigation_id=investigation_id, actor_user_id=user.id, action="visual_analysis.failed", target_type="visual_analysis_run", target_id=str(run.id), details={"document_id": str(document.id), "error": run.error_detail})
+            await db.commit()
+            return _visual_run_dict(run)
+        raise HTTPException(status_code=500, detail="Visual analysis failed") from exc
+
+
+@router.get("/{investigation_id}/documents/{document_id}/visual-analysis-runs")
+async def list_visual_analysis_runs(investigation_id: UUID, document_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    document = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    rows = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation_id, VisualAnalysisRun.document_id == document_id).order_by(VisualAnalysisRun.created_at.desc()))).all()
+    return {"items": [_visual_run_dict(run) for run in rows]}
+
+
+@router.get("/{investigation_id}/visual-analysis-runs")
+async def list_investigation_visual_analysis_runs(investigation_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    rows = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation_id).order_by(VisualAnalysisRun.created_at.desc()))).all()
+    return {"items": [_visual_run_dict(run) for run in rows]}
+
+
+@router.get("/{investigation_id}/visual-analysis-runs/{run_id}")
+async def get_visual_analysis_run(investigation_id: UUID, run_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    run = await db.scalar(select(VisualAnalysisRun).where(VisualAnalysisRun.id == run_id, VisualAnalysisRun.investigation_id == investigation_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="Visual analysis run not found")
+    return _visual_run_dict(run)
 
 
 @router.get("/{investigation_id}/correlation")
@@ -263,6 +377,7 @@ async def list_audit(investigation_id: UUID, db: AsyncSession = Depends(get_db),
     return {
         "items": [{
             "id": str(item.id),
+            "actor_user_id": str(item.actor_user_id) if item.actor_user_id else None,
             "action": item.action,
             "target_type": item.target_type,
             "target_id": item.target_id,
@@ -318,7 +433,91 @@ async def get_dossier(investigation_id: UUID, dossier_id: UUID, db: AsyncSession
     record = await db.scalar(select(DossierSnapshot).where(DossierSnapshot.id == dossier_id, DossierSnapshot.investigation_id == investigation_id))
     if record is None:
         raise HTTPException(status_code=404, detail="Dossier not found")
+    _verify_dossier_integrity(record)
     return _dossier_summary(record)
+
+
+@router.get("/{investigation_id}/dossiers/{dossier_id}/export.json")
+async def export_dossier_json(investigation_id: UUID, dossier_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    record = await db.scalar(select(DossierSnapshot).where(
+        DossierSnapshot.id == dossier_id,
+        DossierSnapshot.investigation_id == investigation_id,
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="Dossier not found")
+    _verify_dossier_integrity(record)
+    await append_audit(
+        db,
+        investigation_id=investigation_id,
+        actor_user_id=user.id,
+        action="dossier.exported",
+        target_type="dossier",
+        target_id=str(record.id),
+        details={"format": "json", "version": record.version, "timestamp": datetime.now(timezone.utc).isoformat(), "actor_user_id": str(user.id), "investigation_id": str(investigation_id)},
+    )
+    await db.commit()
+    return JSONResponse(
+        content=record.snapshot,
+        headers={"Content-Disposition": f'attachment; filename="dossier-v{record.version}.json"', "X-Report-Content-SHA256": record.content_sha256, "X-Report-Version": str(record.version)},
+    )
+
+
+@router.get("/{investigation_id}/dossiers/{dossier_id}/export.html")
+async def export_dossier_html(investigation_id: UUID, dossier_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    record = await db.scalar(select(DossierSnapshot).where(
+        DossierSnapshot.id == dossier_id,
+        DossierSnapshot.investigation_id == investigation_id,
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="Dossier not found")
+    _verify_dossier_integrity(record)
+    await append_audit(
+        db,
+        investigation_id=investigation_id,
+        actor_user_id=user.id,
+        action="dossier.exported",
+        target_type="dossier",
+        target_id=str(record.id),
+        details={"format": "html", "version": record.version, "timestamp": datetime.now(timezone.utc).isoformat(), "actor_user_id": str(user.id), "investigation_id": str(investigation_id)},
+    )
+    await db.commit()
+    return HTMLResponse(
+        content=record.html,
+        headers={"Content-Disposition": f'attachment; filename="dossier-v{record.version}.html"', "X-Report-Content-SHA256": record.content_sha256, "X-Report-Version": str(record.version)},
+    )
+
+
+@router.get("/{investigation_id}/dossiers/{dossier_id}/export.pdf")
+async def export_dossier_pdf(investigation_id: UUID, dossier_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    record = await db.scalar(select(DossierSnapshot).where(
+        DossierSnapshot.id == dossier_id,
+        DossierSnapshot.investigation_id == investigation_id,
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="Dossier not found")
+    _verify_dossier_integrity(record)
+    try:
+        pdf_bytes = await asyncio.to_thread(render_pdf, record.snapshot)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="PDF report generation failed") from exc
+    await append_audit(
+        db,
+        investigation_id=investigation_id,
+        actor_user_id=user.id,
+        action="dossier.exported",
+        target_type="dossier",
+        target_id=str(record.id),
+        details={"format": "pdf", "version": record.version, "timestamp": datetime.now(timezone.utc).isoformat(), "actor_user_id": str(user.id), "investigation_id": str(investigation_id)},
+    )
+    await db.commit()
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="dossier-v{record.version}.pdf"', "X-Report-Content-SHA256": record.content_sha256, "X-Report-Version": str(record.version)},
+    )
 
 
 @router.post("/{investigation_id}/ocr-evaluations", status_code=201)
