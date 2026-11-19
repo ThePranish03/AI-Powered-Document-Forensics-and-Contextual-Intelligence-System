@@ -233,6 +233,76 @@ class VisualAnalysisRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class VisualAnalysisArtifact(Base):
+    __tablename__ = "visual_analysis_artifacts"
+    __table_args__ = (
+        Index("ix_visual_artifacts_run_type", "run_id", "artifact_type"),
+        Index("ix_visual_artifacts_investigation_created", "investigation_id", "created_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("visual_analysis_runs.id", ondelete="CASCADE"), nullable=True, index=True)
+    page_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("visual_analysis_pages.id", ondelete="CASCADE"), nullable=True, index=True)
+    artifact_type: Mapped[str] = mapped_column(String(48))
+    storage_key: Mapped[str] = mapped_column(String(96), unique=True, index=True, default=lambda: uuid.uuid4().hex)
+    mime_type: Mapped[str] = mapped_column(String(64))
+    width_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sha256: Mapped[str] = mapped_column(String(64))
+    derived_from_artifact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("visual_analysis_artifacts.id", ondelete="SET NULL"), nullable=True)
+    transform_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VisualAnalysisPage(Base):
+    __tablename__ = "visual_analysis_pages"
+    __table_args__ = (Index("uq_visual_analysis_pages_run_page", "run_id", "page_number", unique=True),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("visual_analysis_runs.id", ondelete="CASCADE"), index=True)
+    page_number: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    engine: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    engine_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checkpoint_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_page_width_points: Mapped[float | None] = mapped_column(nullable=True)
+    source_page_height_points: Mapped[float | None] = mapped_column(nullable=True)
+    render_width_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    render_height_px: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    render_dpi: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_rotation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    transform_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    integrity_score: Mapped[float | None] = mapped_column(nullable=True)
+    localization_artifact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("visual_analysis_artifacts.id", ondelete="SET NULL"), nullable=True)
+    reliability_artifact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("visual_analysis_artifacts.id", ondelete="SET NULL"), nullable=True)
+    noiseprint_artifact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("visual_analysis_artifacts.id", ondelete="SET NULL"), nullable=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VisualCandidateRegion(Base):
+    __tablename__ = "visual_candidate_regions"
+    __table_args__ = (Index("uq_visual_candidate_regions_page_index", "page_id", "region_index", unique=True),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    page_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("visual_analysis_pages.id", ondelete="CASCADE"), index=True)
+    region_index: Mapped[int] = mapped_column(Integer)
+    bbox_pixel: Mapped[dict] = mapped_column(JSON)
+    bbox_pdf_points: Mapped[dict] = mapped_column(JSON)
+    area_px: Mapped[int] = mapped_column(Integer)
+    mean_localization_score: Mapped[float | None] = mapped_column(nullable=True)
+    max_localization_score: Mapped[float | None] = mapped_column(nullable=True)
+    mean_reliability_value: Mapped[float | None] = mapped_column(nullable=True)
+    threshold_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    postprocess_version: Mapped[str] = mapped_column(String(48))
+    linked_ocr_block_ids: Mapped[list] = mapped_column(JSON, default=list)
+    review_status: Mapped[str] = mapped_column(String(24), default="needs_review")
+    review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TimelineEvent(Base):
     __tablename__ = "timeline_events"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

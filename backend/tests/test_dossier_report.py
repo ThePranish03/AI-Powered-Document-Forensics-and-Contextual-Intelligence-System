@@ -10,6 +10,33 @@ from app.services import dossier_narrative
 from app.services.dossier_report import build_snapshot, render_html, render_pdf
 
 
+@pytest.mark.parametrize(("runs", "expected"), [
+    ([], "not_run"),
+    ([{"id": "r-complete", "document_id": "d1", "source_sha256": "a" * 64, "status": "completed", "analyzer_version": "v1", "model_version": "checkpoint-v1", "result": {"checks": [{"check_type": "trufor_engine", "status": "executed", "algorithm": "TruFor worker", "metrics": {"pages_completed": 1}}]}, "pages": [{"page_number": 1, "status": "completed", "integrity_score": 0.72, "integrity_meaning": "model output; not fraud probability", "localization_artifact_id": "loc-1", "reliability_artifact_id": "rel-1", "regions": [{"region_index": 0, "bbox_pixel": {"x0": 1, "y0": 2, "x1": 3, "y1": 4}, "bbox_pdf_points": {"x0": 1, "y0": 2, "x1": 3, "y1": 4}, "review_status": "accepted", "linked_ocr_block_ids": ["b1"]}]}]}], "completed"),
+    ([{"id": "r-ok", "status": "completed", "result": {"checks": []}}, {"id": "r-failed", "status": "failed", "result": {"checks": []}}], "partial"),
+    ([{"id": "r-failed", "status": "failed", "result": {"checks": []}}], "failed"),
+    ([{"id": "r-unavailable", "status": "unavailable", "result": {"checks": []}}], "unavailable"),
+    ([{"id": "r-processing", "status": "processing", "result": {"checks": []}}], "running"),
+])
+def test_visual_analysis_status_and_details_are_snapshotted(runs, expected):
+    snapshot = build_snapshot(
+        investigation={"id": "case-id", "case_number": "CASE-1", "title": "Review", "status": "in_review"},
+        documents=[], findings=[], timeline=[], nodes=[], correlations=[], discrepancies=[], visual_runs=runs,
+    )
+    assert snapshot["visual_analysis"]["status"] == expected
+    rendered = render_html(snapshot)
+    assert f">{expected}<" in rendered
+    if expected == "completed":
+        assert "a" * 64 in rendered
+        assert "Integrity output" in rendered
+        assert "Localization artifact" in rendered
+        assert "accepted" in rendered and "b1" in rendered
+        assert "not fraud probability" in rendered
+        pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(render_pdf(snapshot))).pages)
+        assert "integrity output" in pdf_text
+        assert "accepted" in pdf_text and "b1" in pdf_text
+
+
 def test_pdf_is_openable_and_contains_report_sections():
     snapshot = build_snapshot(
         investigation={"id": "case-id", "case_number": "CASE-1", "title": "Invoice review", "status": "in_review"},
@@ -19,7 +46,7 @@ def test_pdf_is_openable_and_contains_report_sections():
         findings=[], timeline=[], nodes=[], correlations=[], discrepancies=[],
         visual_runs=[{"id": "visual-run-1", "document_id": "doc-1", "status": "completed", "result": {
             "checks": [{"check_type": "font_baseline", "status": "executed", "algorithm": "PyMuPDF span comparison"}],
-            "observations": [{"finding_id": "visual-finding-1", "page_number": 1, "regions": [{"x0": 1, "y0": 2, "x1": 3, "y1": 4}], "metrics": {"font_size_pt": 4}}],
+            "observations": [{"finding_id": "visual-finding-1", "check_type": "font_baseline", "page_number": 1, "regions": [{"x0": 1, "y0": 2, "x1": 3, "y1": 4}], "metrics": {"font_size_pt": 4}}],
         }}],
     )
     snapshot["report"] = {"dossier_id": "dossier-id", "version": 1, "created_by_user_id": "actor-id", "integrity_sha256": "b" * 64}
@@ -36,6 +63,47 @@ def test_pdf_is_openable_and_contains_report_sections():
     for expected in ("Executive summary", "Document inventory and chain of custody", "OCR-extracted data", "Visual-forensics results", "font_baseline", "Relationship analysis", "Investigation timeline", "Audit trail", "Final conclusion"):
         assert expected in text
     assert "Total 100.00" in text and "block b1" in text
+
+
+def test_pdf_visual_observations_do_not_create_unbreakable_table_rows():
+    snapshot = build_snapshot(
+        investigation={"id": "case-id", "case_number": "CASE-1", "title": "Synthetic review", "status": "in_review"},
+        documents=[], findings=[], timeline=[], nodes=[], correlations=[], discrepancies=[],
+    )
+    reference = {
+        "document_id": "doc-1",
+        "filename": "SYNTHETIC_Apex_Invoice.pdf",
+        "page_number": 1,
+        "block_id": None,
+        "quoted_text": "Synthetic small-type review marker · generated solely for this demo",
+        "bounding_box": {"x0": 52.0, "y0": 365.7, "x1": 170.93, "y1": 371.2},
+    }
+    observations = [{
+        "finding_type": "visual_font_size_outlier",
+        "check_type": "font_baseline",
+        "page_number": 1,
+        "regions": [reference["bounding_box"]],
+        "metrics": {"font": "Helvetica", "font_size_pt": 4.0, "page_median_font_size_pt": 11.0},
+        "evidence_ref": reference,
+    } for _ in range(30)]
+    snapshot["visual_analysis"]["checks"] = [{
+        "check_id": "font_baseline",
+        "method": "PyMuPDF span font-size peer comparison",
+        "status": "executed",
+        "measurements": {"text_spans_inspected": 15, "font_outliers": 1},
+        "result": observations,
+        "source_references": [reference],
+        "diagnostics": {"pages_analyzed": [1], "skipped": []},
+        "limitations": "Footnotes and intentional typographic hierarchy may explain the difference.",
+    }]
+
+    pdf = render_pdf(snapshot)
+
+    assert pdf.startswith(b"%PDF-")
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf)).pages)
+    assert "Synthetic small-type review marker" in text
+    assert "SYNTHETIC_Apex_Invoice.pdf" in text
+    assert "font_size_pt" in text
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,12 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db, require_csrf, require_permission
 from app.api.v1.investigations import owned_investigation, stored_document_path
 from app.core.config import settings
-from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, EvidencePage, EvidenceSpan, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, TimelineEvent, User, VisualAnalysisRun
+from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, EvidencePage, EvidenceSpan, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, TimelineEvent, User, VisualAnalysisArtifact, VisualAnalysisPage, VisualAnalysisRun, VisualCandidateRegion
 from app.services.audit_chain import append_audit, verify_audit_chain
 from app.services.dossier_report import render_pdf, snapshot_digest
 from app.services.investigation_analysis import _finding_dict, _timeline_dict, create_dossier, run_investigation_analysis
 from app.services.ocr_metrics import build_cross_document_correlation, evaluate_samples
 from app.services.visual_forensics import analyze_file
+from app.services.visual_forensics_engine import engine_health_payload
+from app.services.visual_forensics_pipeline import run_engine_pipeline
 
 router = APIRouter()
 REVIEW_STATUSES = {"accepted", "rejected", "dismissed", "needs_review"}
@@ -69,6 +71,11 @@ class SearchRequest(BaseModel):
 class CorrelationReview(BaseModel):
     status: str
     reason: str = Field(min_length=1, max_length=4000)
+
+
+class VisualRegionReview(BaseModel):
+    status: str
+    review_notes: str | None = Field(default=None, max_length=4000)
 
 
 async def _correlation_data(db: AsyncSession, investigation_id: UUID) -> dict:
@@ -186,6 +193,10 @@ async def run_visual_analysis(investigation_id: UUID, document_id: UUID, request
             observation["evidence_ref"] = evidence_refs[0]
             observation["review_status"] = finding.status
             count += 1
+        engine_section = await run_engine_pipeline(db, run, document)
+        if engine_section.get("check_type") == "trufor_engine":
+            result.setdefault("checks", []).append(engine_section)
+            result["engine"] = engine_section.get("engine_health")
         unavailable_checks = [check["check_type"] for check in result.get("checks", []) if check.get("status") in {"unavailable", "partial", "failed"}]
         run.status = "partial" if result.get("status") == "completed" and unavailable_checks else result.get("status", "completed")
         run.result = {**result, "status": run.status, "run_kind": run_kind, "unavailable_checks": unavailable_checks, "observations_written": count}
@@ -231,6 +242,120 @@ async def get_visual_analysis_run(investigation_id: UUID, run_id: UUID, db: Asyn
     if run is None:
         raise HTTPException(status_code=404, detail="Visual analysis run not found")
     return _visual_run_dict(run)
+
+
+def _region_dict(region: VisualCandidateRegion) -> dict:
+    return {
+        "id": str(region.id),
+        "region_index": region.region_index,
+        "bbox_pixel": region.bbox_pixel,
+        "bbox_pdf_points": region.bbox_pdf_points,
+        "area_px": region.area_px,
+        "mean_localization_score": region.mean_localization_score,
+        "max_localization_score": region.max_localization_score,
+        "mean_reliability_value": region.mean_reliability_value,
+        "threshold_config": region.threshold_config,
+        "postprocess_version": region.postprocess_version,
+        "linked_ocr_block_ids": region.linked_ocr_block_ids or [],
+        "review_status": region.review_status,
+        "review_notes": region.review_notes,
+        "reviewed_at": region.reviewed_at.isoformat() if region.reviewed_at else None,
+    }
+
+
+def _visual_page_dict(page: VisualAnalysisPage, regions: list[VisualCandidateRegion]) -> dict:
+    return {
+        "id": str(page.id),
+        "run_id": str(page.run_id),
+        "page_number": page.page_number,
+        "status": page.status,
+        "engine": page.engine,
+        "engine_version": page.engine_version,
+        "checkpoint_sha256": page.checkpoint_sha256,
+        "device": page.device,
+        "source_page_width_points": page.source_page_width_points,
+        "source_page_height_points": page.source_page_height_points,
+        "render_width_px": page.render_width_px,
+        "render_height_px": page.render_height_px,
+        "render_dpi": page.render_dpi,
+        "page_rotation": page.page_rotation,
+        "transform": page.transform_json or {},
+        "integrity_score": page.integrity_score,
+        "localization_artifact_id": str(page.localization_artifact_id) if page.localization_artifact_id else None,
+        "reliability_artifact_id": str(page.reliability_artifact_id) if page.reliability_artifact_id else None,
+        "noiseprint_artifact_id": str(page.noiseprint_artifact_id) if page.noiseprint_artifact_id else None,
+        "diagnostics": page.diagnostics_json or {},
+        "regions": [_region_dict(region) for region in regions],
+    }
+
+
+@router.get("/{investigation_id}/visual-analysis-runs/{run_id}/pages")
+async def get_visual_analysis_run_pages(investigation_id: UUID, run_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    run = await db.scalar(select(VisualAnalysisRun).where(VisualAnalysisRun.id == run_id, VisualAnalysisRun.investigation_id == investigation_id))
+    if run is None:
+        raise HTTPException(status_code=404, detail="Visual analysis run not found")
+    pages = (await db.scalars(select(VisualAnalysisPage).where(VisualAnalysisPage.run_id == run_id).order_by(VisualAnalysisPage.page_number))).all()
+    if not pages:
+        return {"run_id": str(run_id), "items": []}
+    regions = (await db.scalars(select(VisualCandidateRegion).where(VisualCandidateRegion.page_id.in_([page.id for page in pages])))).all()
+    regions_by_page: dict = {}
+    for region in regions:
+        regions_by_page.setdefault(str(region.page_id), []).append(region)
+    return {"run_id": str(run_id), "items": [_visual_page_dict(page, sorted(regions_by_page.get(str(page.id), []), key=lambda item: item.region_index)) for page in pages]}
+
+
+@router.patch("/{investigation_id}/visual-candidate-regions/{region_id}")
+async def review_visual_candidate_region(investigation_id: UUID, region_id: UUID, payload: VisualRegionReview, request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:update"))):
+    await owned_investigation(db, user, investigation_id)
+    require_csrf(request)
+    if payload.status not in REVIEW_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid visual region review status")
+    row = await db.execute(select(VisualCandidateRegion, VisualAnalysisPage, VisualAnalysisRun).join(VisualAnalysisPage, VisualAnalysisPage.id == VisualCandidateRegion.page_id).join(VisualAnalysisRun, VisualAnalysisRun.id == VisualAnalysisPage.run_id).where(VisualCandidateRegion.id == region_id, VisualAnalysisRun.investigation_id == investigation_id))
+    region, page, run = row.first() or (None, None, None)
+    if region is None:
+        raise HTTPException(status_code=404, detail="Visual candidate region not found")
+    region.review_status = payload.status
+    region.review_notes = payload.review_notes
+    region.reviewed_by_user_id = user.id
+    region.reviewed_at = datetime.now(timezone.utc)
+    await append_audit(db, investigation_id=investigation_id, actor_user_id=user.id, action="visual_candidate_region.reviewed", target_type="visual_candidate_region", target_id=str(region.id), details={"status": region.review_status, "page_number": page.page_number, "run_id": str(run.id), "review_notes": region.review_notes})
+    await db.commit()
+    return _region_dict(region)
+
+
+@router.get("/{investigation_id}/visual-analysis-artifacts/{artifact_id}")
+async def get_visual_analysis_artifact(investigation_id: UUID, artifact_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    artifact = await db.scalar(select(VisualAnalysisArtifact).where(VisualAnalysisArtifact.id == artifact_id, VisualAnalysisArtifact.investigation_id == investigation_id))
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Visual analysis artifact not found")
+    path = Path(settings.visual_forensics_artifact_dir) / f"{artifact.storage_key}.png"
+    if not path.is_file():
+        raise HTTPException(status_code=410, detail="Visual analysis artifact file is missing from private storage")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != artifact.sha256:
+        raise HTTPException(status_code=409, detail="Stored visual analysis artifact hash does not match its recorded SHA-256")
+    await append_audit(
+        db,
+        investigation_id=investigation_id,
+        actor_user_id=user.id,
+        action="visual_analysis.artifact_accessed",
+        target_type="visual_analysis_artifact",
+        target_id=str(artifact.id),
+        details={"artifact_type": artifact.artifact_type, "sha256": artifact.sha256},
+    )
+    await db.commit()
+    return FileResponse(path, media_type=artifact.mime_type, content_disposition_type="inline", headers={"X-Content-SHA256": artifact.sha256, "Cache-Control": "no-store"})
+
+
+@router.get("/{investigation_id}/visual-forensics-engine")
+async def get_visual_forensics_engine_health(investigation_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+    await owned_investigation(db, user, investigation_id)
+    return engine_health_payload()
 
 
 @router.get("/{investigation_id}/correlation")

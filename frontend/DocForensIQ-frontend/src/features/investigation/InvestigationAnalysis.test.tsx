@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import InvestigationAnalysis from './InvestigationAnalysis';
 
@@ -22,13 +22,12 @@ describe('visual evidence review', () => {
       </QueryClientProvider>,
     );
 
-    expect(await screen.findByRole('heading', { name: 'Visual evidence review' })).toBeInTheDocument();
-    expect(screen.getByText('OCR confidence and identical file hashes are separate signals. Neither is visual analysis, and neither establishes authenticity.')).toBeInTheDocument();
-    expect(await screen.findByRole('heading', { name: 'No visual runs yet' })).toBeInTheDocument();
-    expect(screen.getAllByText('Source dependent')).toHaveLength(4);
+    expect(await screen.findByRole('heading', { name: 'Visual forensics' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'No stored source documents' })).toBeInTheDocument();
+    expect(screen.getByText(/No TruFor model output exists for this workspace/)).toBeInTheDocument();
   });
 
-  it('runs analysis for a listed stored document and renders the persisted source-linked candidate', async () => {
+  it('starts analysis for the selected stored document and shows its source-linked candidate', async () => {
     let savedRun: Record<string, unknown> | null = null;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -43,10 +42,13 @@ describe('visual evidence review', () => {
     vi.stubGlobal('fetch', fetchMock);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(<QueryClientProvider client={queryClient}><MemoryRouter><InvestigationAnalysis investigationId="case-1" section="visual"/></MemoryRouter></QueryClientProvider>);
-    fireEvent.click(await screen.findByRole('button', { name: 'Run visual analysis' }));
-    expect(await screen.findByText('Measured source font-size outlier.')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Open source page and region' })).toHaveAttribute('href', expect.stringContaining('x0=10'));
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/documents/doc-7/visual-analysis-runs'), expect.objectContaining({ method: 'POST' }));
+    const runButton = await screen.findByRole('button', { name: 'Run visual analysis' });
+    await waitFor(() => expect(runButton).toBeEnabled());
+    fireEvent.click(runButton);
+    expect(await screen.findAllByText('Measured source font-size outlier.')).toHaveLength(2);
+    expect(screen.getByRole('link', { name: 'Open source region' })).toHaveAttribute('href', expect.stringContaining('x0=10'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/documents/doc-7/visual-analysis-runs'), expect.objectContaining({ method: 'POST' })));
+    expect(savedRun).toMatchObject({ id: 'run-1', status: 'completed' });
   });
 
   it('groups retries under one document and distinguishes partial results from no-findings runs', async () => {
@@ -59,10 +61,11 @@ describe('visual evidence review', () => {
     }));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(<QueryClientProvider client={queryClient}><MemoryRouter><InvestigationAnalysis investigationId="case-1" section="visual"/></MemoryRouter></QueryClientProvider>);
-    expect(await screen.findByText('Analysis run history · 2 saved runs')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Analysis run history' })).toBeInTheDocument();
+    expect(screen.getByText('2 runs for this source')).toBeInTheDocument();
     expect(screen.getByText(/Previous run 1/)).toBeInTheDocument();
-    expect(screen.getAllByText(/Partial analysis: one or more checks were unavailable/)).toHaveLength(2);
-    expect(screen.getAllByText(/Unavailable\/skipped: PDF vectors and text cannot be isolated/)).toHaveLength(2);
+    expect(screen.getAllByText(/Partial analysis\. Some checks were unavailable/)).toHaveLength(2);
+    expect(screen.getAllByText(/Unavailable: PDF vectors and text cannot be isolated/)).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'Retry analysis' })).toBeEnabled();
   });
 });

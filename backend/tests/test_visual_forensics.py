@@ -1,6 +1,8 @@
 """Algorithm integration checks against generated source PDF/image bytes (not UI screenshots)."""
 import numpy as np
 import pytest
+from uuid import UUID
+from sqlalchemy import select
 from dataclasses import replace
 
 fitz = pytest.importorskip("fitz")
@@ -9,6 +11,7 @@ cv2 = pytest.importorskip("cv2")
 from app.services.visual_forensics import analyze_file
 from app.api.v1 import auth as auth_routes, investigations as investigations_routes
 from app.core.config import settings
+from app.models.entities import VisualAnalysisPage, VisualCandidateRegion
 
 PASSWORD = "StrongPassword123"
 
@@ -221,7 +224,7 @@ async def test_visual_api_persists_runs_findings_evidence_and_audit(client, monk
         results.append(response.json())
     assert results[0]["status"] == "partial"
     assert results[1]["status"] == "partial"
-    assert results[0]["result"]["unavailable_checks"] == ["compression_resampling"]
+    assert results[0]["result"]["unavailable_checks"] == ["compression_resampling", "trufor_engine"]
     flagged = [item for item in results[0]["result"]["observations"] if item["finding_type"] == "visual_font_size_outlier"]
     clean = [item for item in results[1]["result"]["observations"] if item["finding_type"] == "visual_font_size_outlier"]
     assert flagged and not clean
@@ -237,6 +240,24 @@ async def test_visual_api_persists_runs_findings_evidence_and_audit(client, monk
     assert retry.status_code == 201
     assert retry.json()["result"]["run_kind"] == "retry"
     assert retry.json()["status"] == "partial"
+    sessions = client._transport.app.state.test_sessions
+    async with sessions() as session:
+        page = await session.scalar(select(VisualAnalysisPage).where(VisualAnalysisPage.run_id == UUID(retry.json()["id"])))
+        if page is None:
+            page = VisualAnalysisPage(run_id=UUID(retry.json()["id"]), page_number=1, status="unavailable")
+            session.add(page)
+            await session.flush()
+        region = VisualCandidateRegion(page_id=page.id, region_index=0, bbox_pixel={"x0": 10, "y0": 20, "x1": 50, "y1": 60}, bbox_pdf_points={"x0": 5, "y0": 10, "x1": 25, "y1": 30}, area_px=1600, postprocess_version="test")
+        session.add(region)
+        await session.commit()
+        region_id = str(region.id)
+    disposition = await client.patch(f"/api/v1/investigations/{case_id}/visual-candidate-regions/{region_id}", headers=headers, json={"status": "accepted", "review_notes": "Compared against source ledger"})
+    assert disposition.status_code == 200
+    assert disposition.json()["review_status"] == "accepted"
+    pages = await client.get(f"/api/v1/investigations/{case_id}/visual-analysis-runs/{retry.json()['id']}/pages")
+    assert pages.status_code == 200
+    assert pages.json()["items"][0]["regions"][0]["review_notes"] == "Compared against source ledger"
     audit = await client.get(f"/api/v1/investigations/{case_id}/audit")
     assert audit.json()["verification"]["valid"]
     assert any(item["action"] == "visual_analysis.completed" for item in audit.json()["items"])
+    assert any(item["action"] == "visual_candidate_region.reviewed" for item in audit.json()["items"])

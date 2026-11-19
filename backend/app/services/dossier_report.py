@@ -32,7 +32,27 @@ def snapshot_digest(snapshot: dict, report_html: str) -> str:
     return hashlib.sha256((canonical + "\n" + report_html).encode("utf-8")).hexdigest()
 
 
+def _visual_check_records(runs: list[dict]) -> list[dict]:
+    records = []
+    for run in runs:
+        observations = run.get("result", {}).get("observations", [])
+        for check in run.get("result", {}).get("checks", []):
+            method_observations = [item for item in observations if item.get("check_type") == check.get("check_type")]
+            records.append({
+                "run_id": run.get("id"), "check_id": check.get("check_type"),
+                "method": check.get("algorithm"), "status": check.get("status"),
+                "measurements": check.get("metrics", {}), "result": method_observations,
+                "source_references": [item.get("evidence_ref") for item in method_observations if item.get("evidence_ref")],
+                "diagnostics": {"pages_analyzed": check.get("pages_analyzed", []), "skipped": check.get("skipped", [])},
+                "limitations": "Observations are candidates requiring investigator review; visual signals alone do not establish authenticity.",
+            })
+    return records
+
+
 def build_snapshot(*, investigation: dict, documents: list[dict], findings: list[dict], timeline: list[dict], nodes: list[dict], correlations: list[dict], discrepancies: list[dict], audit_activity: list[dict] | None = None, document_relationships: list[dict] | None = None, audit_verification: dict | None = None, visual_runs: list[dict] | None = None) -> dict:
+    visual_runs = visual_runs or []
+    visual_statuses = [run.get("status") for run in visual_runs]
+    visual_status = "not_run" if not visual_runs else "failed" if all(status == "failed" for status in visual_statuses) else "unavailable" if all(status == "unavailable" for status in visual_statuses) else "completed" if all(status == "completed" for status in visual_statuses) else "running" if all(status in {"queued", "processing"} for status in visual_statuses) else "partial"
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "label": "Evidence snapshot. Automated items remain candidates until an investigator reviews them.",
@@ -47,13 +67,11 @@ def build_snapshot(*, investigation: dict, documents: list[dict], findings: list
         "cross_document_links": correlations,
         "cross_document_discrepancies": discrepancies,
         "visual_analysis": {
-            "status": "completed" if any(run.get("status") == "completed" for run in (visual_runs or [])) else ("partial" if visual_runs else "not_run"),
-            "runs": visual_runs or [],
-            "checks": [
-                {"check_id": check.get("check_type"), "status": check.get("status"), "result": run.get("result", {}).get("observations", []), "evidence_ref": None,
-                 "explanation": check.get("algorithm"), "limitations": "Observations are candidates requiring investigator review; visual signals alone do not establish authenticity."}
-                for run in (visual_runs or []) for check in run.get("result", {}).get("checks", [])
-            ],
+            "status": visual_status,
+            "runs": visual_runs,
+            "checks": _visual_check_records(visual_runs),
+            "methodology": "Visual checks are reported as distinct methods. TruFor integrity output uses the recorded model semantics and is not a fraud probability; map artifacts and candidate regions are source-linked when present.",
+            "limitations": ["No model output is inferred when the engine did not produce it.", "Localization and reliability artifacts are analytical outputs and do not establish manipulation.", "Region coordinates are retained in their recorded pixel and PDF point spaces; OCR links are included only when stored.", "A report captures investigator disposition at snapshot generation time."],
         },
         "timeline": timeline,
         "findings": findings,
@@ -130,8 +148,11 @@ def render_html(snapshot: dict) -> str:
         _esc(item.get("explanation")), _esc(item.get("review_reason") or "None"), _refs(item.get("evidence_refs", []))) for item in snapshot.get("cross_document_links", []))
     discrepancies = "".join("<article><h3>{}</h3><p>{}</p><p>{}</p><ul>{}</ul></article>".format(
         _esc(item.get("title")), _esc(item.get("description")), _esc(item.get("limitations")), _refs(item.get("evidence_refs", []))) for item in snapshot.get("cross_document_discrepancies", []))
-    visual_checks = "".join("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-        _esc(item.get("check_id")), _esc(item.get("status")), _esc(item.get("result") or "No result"), _esc(item.get("limitations"))) for item in snapshot.get("visual_analysis", {}).get("checks", []))
+    visual_checks = "".join("<tr><td>{}</td><td>{}</td><td>{}</td><td><pre>{}</pre></td><td><pre>{}</pre></td><td><pre>{}</pre></td><td>{}</td></tr>".format(
+        _esc(item.get("check_id")), _esc(item.get("method") or "not recorded"), _esc(item.get("status")), _esc(item.get("measurements") or "No measurements"), _esc({"observations": item.get("result"), "source_references": item.get("source_references")}), _esc(item.get("diagnostics")), _esc(item.get("limitations"))) for item in snapshot.get("visual_analysis", {}).get("checks", []))
+    visual_runs = "".join("<article><h3>Run {}</h3><p>Document <code>{}</code> · source SHA-256 <code>{}</code> · status {} · analyzer/model {}/{}</p>{}</article>".format(
+        _esc(run.get("id")), _esc(run.get("document_id")), _esc(run.get("source_sha256") or "not available"), _esc(run.get("status")), _esc(run.get("analyzer_version") or "not recorded"), _esc(run.get("model_version") or "not reported"),
+        "".join("<h4>Page {}</h4><p>Status {} · Integrity output {} ({})</p><p>Localization artifact {} · Reliability artifact {}</p>{}".format(_esc(page.get("page_number")), _esc(page.get("status")), _esc(page.get("integrity_score") if page.get("integrity_score") is not None else "unavailable"), _esc(page.get("integrity_meaning") or "meaning not recorded"), _esc(page.get("localization_artifact_id") or "unavailable"), _esc(page.get("reliability_artifact_id") or "unavailable"), "<ul>" + "".join("<li>Region {} · pixel {} · PDF points {} · disposition {} · OCR blocks {}</li>".format(_esc(region.get("region_index")), _esc(region.get("bbox_pixel")), _esc(region.get("bbox_pdf_points")), _esc(region.get("review_status", "needs_review")), _esc(", ".join(region.get("linked_ocr_block_ids", [])) or "none recorded")) for region in page.get("regions", [])) + "</ul>") for page in run.get("pages", [])) or "<p>No page-level outputs were stored.</p>") for run in snapshot.get("visual_analysis", {}).get("runs", []))
     timeline = "".join("<li><b>{}</b> {} · {} · confidence {} {}</li>".format(
         _esc(item.get("raw_date")), "(ambiguous date)" if item.get("ambiguous") else "", _esc(item.get("description")),
         _esc(item.get("confidence")), _refs(item.get("evidence_refs", []))) for item in snapshot.get("timeline", []))
@@ -155,7 +176,7 @@ def render_html(snapshot: dict) -> str:
 <h2>OCR-extracted data and source traceability</h2>{''.join(extracted) or '<p>No OCR text is available.</p>'}
 <h2>Cross-document verification</h2>{''.join(correlations) or '<p>No cross-document identifier links were found.</p>'}{''.join(discrepancies) or '<p>No supported cross-document discrepancies were found.</p>'}
 <h2>Evidence-backed findings and analyst disposition</h2>{''.join(findings) or '<p>No findings are stored for this investigation.</p>'}
-<h2>Visual-forensics results</h2><p>Status: <span class="badge">{_esc(snapshot.get("visual_analysis", {}).get("status"))}</span>. Measured observations remain candidates for investigator review and do not determine authenticity.</p><table><thead><tr><th>Check</th><th>Status</th><th>Result</th><th>Limitations</th></tr></thead><tbody>{visual_checks or '<tr><td colspan="4">No visual checks were recorded.</td></tr>'}</tbody></table>
+<h2>Visual-forensics results</h2><p>Status: <span class="badge">{_esc(snapshot.get("visual_analysis", {}).get("status"))}</span>. {_esc(snapshot.get("visual_analysis", {}).get("methodology"))}</p>{visual_runs or '<p>No visual analysis runs were recorded.</p>'}<table><thead><tr><th>Method</th><th>Implementation</th><th>Status</th><th>Measurements</th><th>Candidate observations and source references</th><th>Diagnostics</th><th>Limitations</th></tr></thead><tbody>{visual_checks or '<tr><td colspan="7">No visual checks were recorded.</td></tr>'}</tbody></table><ul>{lists(snapshot.get("visual_analysis", {}).get("limitations", []))}</ul>
 <h2>Relationship analysis</h2>{''.join(graph) or '<p>No investigation relationship graph nodes are stored.</p>'}{''.join(relationships) or '<p>No per-document relationship extraction payloads are stored.</p>'}
 <h2>Investigation timeline</h2><ul>{timeline or '<li>No timeline events are stored.</li>'}</ul>
 <h2>Audit trail and chain of custody</h2><p>Audit chain verification: <b>{'valid' if snapshot.get('audit_chain_verification', {}).get('valid') else 'not verified or invalid'}</b> · { _esc(snapshot.get('audit_chain_verification', {}).get('verified_count', 0)) }/{_esc(snapshot.get('audit_chain_verification', {}).get('event_count', 0))} events verified. {_esc(snapshot.get('audit_chain_verification', {}).get('reason') or '')}</p><table><thead><tr><th>Timestamp</th><th>Action</th><th>Target</th><th>Actor user ID</th><th>Previous hash</th><th>Event hash</th></tr></thead><tbody>{audit or '<tr><td colspan="6">No audit events were stored.</td></tr>'}</tbody></table>
@@ -254,8 +275,48 @@ def render_pdf(snapshot: dict) -> bytes:
         for ref in item.get("evidence_refs", []): story.append(para(f"Source {ref.get('filename') or ref.get('document_id')} · page {ref.get('page_number')} · block {ref.get('block_id')} · coordinates {ref.get('bounding_box', 'not recorded')}: {ref.get('quoted_text')}", "Small"))
         story.append(Spacer(1, 5))
     if not snapshot.get("findings"): story.append(para("No findings are stored for this investigation."))
-    section("Visual-forensics results", f"Status: {snapshot.get('visual_analysis', {}).get('status')}. Measured observations are candidates requiring investigator review and do not determine authenticity.")
-    table([["Check", "Status", "Result", "Limitations"]] + [[c.get("check_id", ""), c.get("status", ""), str(c.get("result") or "No result"), c.get("limitations", "")] for c in snapshot.get("visual_analysis", {}).get("checks", [])], [42 * mm, 28 * mm, 33 * mm, 67 * mm])
+    visual = snapshot.get("visual_analysis", {})
+    section("Visual-forensics results", f"Status: {visual.get('status')}. {visual.get('methodology', 'No visual method documentation was stored.')}")
+    for run in visual.get("runs", []):
+        story.extend([para(f"Run {run.get('id')} · document {run.get('document_id')} · source SHA-256 {run.get('source_sha256') or 'not available'}", "Heading3"), para(f"Status: {run.get('status')} · analyzer version {run.get('analyzer_version') or 'not recorded'} · model/checkpoint {run.get('model_version') or 'not reported'} · created {run.get('created_at') or 'not available'}", "Small")])
+        if run.get("error_detail"): story.append(para(f"Run diagnostic: {run['error_detail']}", "Small"))
+        for page in run.get("pages", []):
+            story.append(para(f"Page {page.get('page_number')} · {page.get('status')} · integrity output {page.get('integrity_score') if page.get('integrity_score') is not None else 'unavailable'} ({page.get('integrity_meaning') or 'meaning not recorded'})", "Small"))
+            story.append(para(f"Localization artifact: {page.get('localization_artifact_id') or 'unavailable'} · Reliability artifact: {page.get('reliability_artifact_id') or 'unavailable'} · Diagnostics: {json.dumps(page.get('diagnostics') or {}, ensure_ascii=False)}", "Small"))
+            for region in page.get("regions", []):
+                story.append(para(f"Candidate region {region.get('region_index')} · pixel {region.get('bbox_pixel')} · PDF points {region.get('bbox_pdf_points')} · disposition {region.get('review_status', 'needs_review')} · OCR blocks {', '.join(region.get('linked_ocr_block_ids', [])) or 'none stored'} · review note {region.get('review_notes') or 'none'}", "Small"))
+    for check in visual.get("checks", []):
+        story.append(para(f"Method key: {check.get('check_id')} · {check.get('method') or 'implementation not recorded'}", "Small"))
+    checks = visual.get("checks", [])
+    table([["Method", "Implementation", "Status", "Measurements", "Candidate observations", "Diagnostics", "Limitations"]] + [[
+        c.get("check_id", ""),
+        c.get("method") or "not recorded",
+        c.get("status", ""),
+        json.dumps(c.get("measurements") or {}, ensure_ascii=False),
+        f"{len(c.get('result') or [])} candidate(s); source details follow" if c.get("result") else "None recorded",
+        json.dumps(c.get("diagnostics") or {}, ensure_ascii=False),
+        c.get("limitations", ""),
+    ] for c in checks], [20 * mm, 26 * mm, 14 * mm, 24 * mm, 34 * mm, 22 * mm, 30 * mm])
+    for check in checks:
+        for observation in check.get("result", []):
+            reference = observation.get("evidence_ref") or {}
+            regions = observation.get("regions") or reference.get("regions") or []
+            coordinates = reference.get("bounding_box") or (regions[0] if regions else "not recorded")
+            source = reference.get("filename") or reference.get("document_id") or "source not recorded"
+            page_number = reference.get("page_number") or observation.get("page_number") or "not recorded"
+            block_id = reference.get("block_id") or "not recorded"
+            story.extend([
+                para(f"Candidate observation · {observation.get('finding_type') or observation.get('check_type') or check.get('check_id')} · page {page_number}", "Heading3"),
+                para(f"Source: {source} · OCR block: {block_id} · coordinates: {coordinates}", "Small"),
+                para(f"Quoted text: {reference.get('quoted_text') or observation.get('quoted_text') or 'not recorded'} · Measurements: {json.dumps(observation.get('metrics') or {}, ensure_ascii=False)}", "Small"),
+            ])
+        if not check.get("result"):
+            for reference in check.get("source_references", []):
+                story.append(para(
+                    f"Source reference · {reference.get('filename') or reference.get('document_id') or 'source not recorded'} · page {reference.get('page_number') or 'not recorded'} · OCR block {reference.get('block_id') or 'not recorded'} · coordinates {reference.get('bounding_box') or 'not recorded'} · {reference.get('quoted_text') or ''}",
+                    "Small",
+                ))
+    for item in visual.get("limitations", []): story.append(para("• " + item, "Small"))
     section("Relationship analysis")
     for node in snapshot.get("relationship_overview", []): story.append(para(f"{node.get('label')} · {node.get('type')} · {node.get('review_status')} · documents {', '.join(node.get('document_ids', []))}")); story.append(para(node.get("basis", ""), "Small"))
     for relation in snapshot.get("document_relationships", []): story.append(para(relation.get("filename", "Document"), "Heading3")); story.append(para(json.dumps(relation.get("payload", {}), ensure_ascii=False), "Small"))

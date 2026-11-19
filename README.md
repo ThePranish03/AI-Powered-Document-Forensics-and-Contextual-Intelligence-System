@@ -97,6 +97,8 @@ Configure the frontend API URL and registration/demo settings in `.env.local`. S
 
 **Important:** Apply Alembic migrations before starting the API. The API does not create database tables automatically.
 
+The synthetic, reproducible [Grand Finale visual-forensics walkthrough](docs/grand-finale-visual-forensics.md) covers multi-document upload through dossier and audit review. It clearly distinguishes deterministic checks from unavailable OCR or TruFor capabilities.
+
 ### Local service URLs
 
 | Service | URL |

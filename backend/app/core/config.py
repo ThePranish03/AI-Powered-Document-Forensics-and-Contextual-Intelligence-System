@@ -24,6 +24,16 @@ class Settings:
     xai_base_url: str
     xai_model: str
     relationship_extraction_enabled: bool
+    visual_forensics_enabled: bool
+    trufor_worker_url: str
+    trufor_model_version: str
+    trufor_checkpoint_sha256: str
+    trufor_device: str
+    trufor_max_image_pixels: int
+    trufor_render_dpi: int
+    trufor_job_timeout_seconds: float
+    trufor_max_concurrent_pages: int
+    visual_forensics_artifact_dir: str
 
     @property
     def production(self) -> bool:
@@ -64,6 +74,16 @@ def load_settings() -> Settings:
         xai_base_url=os.getenv("XAI_BASE_URL", "https://api.x.ai/v1").rstrip("/"),
         xai_model=os.getenv("XAI_MODEL", "xai/grok-4.7"),
         relationship_extraction_enabled=os.getenv("RELATIONSHIP_EXTRACTION_ENABLED", "false").lower() == "true",
+        visual_forensics_enabled=os.getenv("VISUAL_FORENSICS_ENABLED", "false").lower() == "true",
+        trufor_worker_url=os.getenv("TRUFOR_WORKER_URL", "").rstrip("/"),
+        trufor_model_version=os.getenv("TRUFOR_MODEL_VERSION", ""),
+        trufor_checkpoint_sha256=os.getenv("TRUFOR_CHECKPOINT_SHA256", ""),
+        trufor_device=os.getenv("TRUFOR_DEVICE", "cpu"),
+        trufor_max_image_pixels=int(os.getenv("TRUFOR_MAX_IMAGE_PIXELS", str(20_000_000))),
+        trufor_render_dpi=int(os.getenv("TRUFOR_RENDER_DPI", "200")),
+        trufor_job_timeout_seconds=float(os.getenv("TRUFOR_JOB_TIMEOUT_SECONDS", "120")),
+        trufor_max_concurrent_pages=int(os.getenv("TRUFOR_MAX_CONCURRENT_PAGES", "1")),
+        visual_forensics_artifact_dir=os.getenv("VISUAL_FORENSICS_ARTIFACT_DIR", "./private_uploads/visual_artifacts"),
     )
 
 

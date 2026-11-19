@@ -15,6 +15,9 @@ from app.models.entities import (
     RelationshipAnalysis,
     TimelineEvent,
     VisualAnalysisRun,
+    VisualAnalysisPage,
+    VisualAnalysisArtifact,
+    VisualCandidateRegion,
 )
 from app.services.audit_chain import append_audit, verify_audit_chain
 from app.services.dossier_narrative import generate_grounded_narrative
@@ -211,6 +214,26 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         .order_by(AuditChainEvent.created_at, AuditChainEvent.id)
     )).all()
     visual_runs = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation.id).order_by(VisualAnalysisRun.created_at, VisualAnalysisRun.id))).all()
+    visual_run_snapshot = []
+    document_by_id = {str(document.id): document for document, _ in document_rows}
+    for run in visual_runs:
+        pages = (await db.scalars(select(VisualAnalysisPage).where(VisualAnalysisPage.run_id == run.id).order_by(VisualAnalysisPage.page_number))).all()
+        page_items = []
+        for page in pages:
+            regions = (await db.scalars(select(VisualCandidateRegion).where(VisualCandidateRegion.page_id == page.id).order_by(VisualCandidateRegion.region_index))).all()
+            artifacts = (await db.scalars(select(VisualAnalysisArtifact).where(VisualAnalysisArtifact.page_id == page.id))).all()
+            page_items.append({
+                "page_number": page.page_number, "status": page.status, "engine": page.engine,
+                "engine_version": page.engine_version, "checkpoint_sha256": page.checkpoint_sha256,
+                "integrity_score": page.integrity_score, "integrity_meaning": "Model output as defined by the recorded engine; not a calibrated fraud probability or authenticity verdict.",
+                "transform": page.transform_json, "diagnostics": page.diagnostics_json,
+                "artifacts": [{"id": str(item.id), "type": item.artifact_type, "sha256": item.sha256, "width_px": item.width_px, "height_px": item.height_px, "mime_type": item.mime_type} for item in artifacts],
+                "localization_artifact_id": str(page.localization_artifact_id) if page.localization_artifact_id else None,
+                "reliability_artifact_id": str(page.reliability_artifact_id) if page.reliability_artifact_id else None,
+                "regions": [{"id": str(region.id), "region_index": region.region_index, "bbox_pixel": region.bbox_pixel, "bbox_pdf_points": region.bbox_pdf_points, "mean_localization_score": region.mean_localization_score, "max_localization_score": region.max_localization_score, "mean_reliability_value": region.mean_reliability_value, "linked_ocr_block_ids": region.linked_ocr_block_ids, "review_status": region.review_status, "review_notes": region.review_notes, "reviewed_by_user_id": str(region.reviewed_by_user_id) if region.reviewed_by_user_id else None, "reviewed_at": region.reviewed_at.isoformat() if region.reviewed_at else None} for region in regions],
+            })
+        document = document_by_id.get(str(run.document_id))
+        visual_run_snapshot.append({"id": str(run.id), "document_id": str(run.document_id), "source_sha256": document.sha256 if document else None, "status": run.status, "analyzer_version": run.analyzer_version, "model_version": (run.result or {}).get("engine", {}).get("model_version") if isinstance((run.result or {}).get("engine"), dict) else None, "result": run.result, "pages": page_items, "created_at": run.created_at.isoformat(), "completed_at": run.completed_at.isoformat() if run.completed_at else None, "error_detail": run.error_detail})
     version = (await db.scalar(select(func.max(DossierSnapshot.version)).where(DossierSnapshot.investigation_id == investigation.id)) or 0) + 1
     correlation = build_cross_document_correlation([{
         "document_id": str(document.id),
@@ -274,7 +297,7 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         } for item in audit_events],
         document_relationships=[{"document_id": str(document.id), "filename": document.filename, "payload": record.payload, "model": record.model, "schema_version": record.schema_version, "created_at": record.created_at.isoformat()} for record, document in relationship_rows],
         audit_verification=verify_audit_chain(audit_events),
-        visual_runs=[{"id": str(run.id), "document_id": str(run.document_id), "status": run.status, "analyzer_version": run.analyzer_version, "result": run.result, "created_at": run.created_at.isoformat(), "completed_at": run.completed_at.isoformat() if run.completed_at else None} for run in visual_runs],
+        visual_runs=visual_run_snapshot,
     )
     source_blocks = {
         (str(document.id), str(block.get("block_id"))): block

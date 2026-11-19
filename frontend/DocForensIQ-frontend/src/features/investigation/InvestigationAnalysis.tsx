@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { AlignLeft, Check, ChevronLeft, ChevronRight, Clock3, Download, Eye, FileImage, FileSearch, FileText, Fingerprint, GitBranch, Image as ImageIcon, Layers3, Search, ShieldAlert, SlidersHorizontal, ZoomIn, ZoomOut } from 'lucide-react';
+import { AlignLeft, Check, ChevronLeft, ChevronRight, Clock3, Cpu, Download, Eye, FileImage, FileSearch, FileText, Fingerprint, GitBranch, Image as ImageIcon, Layers3, Search, ShieldAlert, SlidersHorizontal, ZoomIn, ZoomOut } from 'lucide-react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { ApiError, apiBlob, apiRequest } from '../../services/apiClient';
@@ -86,7 +86,11 @@ interface AnalysisDiagnostics {
 
 interface VisualDocument { id: string; filename: string; content_type: string; processing_status: string; sha256?: string | null; }
 interface VisualOcrBlock { block_id: string; page_index?: number; text: string; engine_bbox?: unknown; engine_confidence?: number | null; }
-interface VisualRun { id: string; document_id: string; status: string; result: { run_kind?: 'new' | 'retry'; page_count?: number; checks?: Array<{ check_type: string; status: string; algorithm: string; pages_analyzed?: number[]; metrics?: Record<string, unknown>; skipped?: Array<{ reason?: string }> }>; observations?: Array<{ finding_id: string; investigation_id: string; document_id: string; page_number: number; regions: Array<{ x0: number; y0: number; x1: number; y1: number }>; check_type: string; algorithm: string; metrics: Record<string, unknown>; explanation: string; limitations: string; evidence_ref: EvidenceRef & { bounding_box?: Record<string, number>; regions?: Array<Record<string, number>> }; review_status: string }> }; error_detail?: string | null; created_at: string; started_at?: string | null; completed_at?: string | null; }
+interface EngineHealth { engine: string; feature_enabled: boolean; available: boolean; reason: string | null; model_version: string | null; checkpoint_sha256: string | null; device: string | null; }
+interface VisualRegionBox { x0: number; y0: number; x1: number; y1: number; }
+interface VisualCandidateRegionItem { id: string; region_index: number; bbox_pixel: VisualRegionBox; bbox_pdf_points: VisualRegionBox; area_px: number; mean_localization_score: number | null; max_localization_score: number | null; mean_reliability_value: number | null; threshold_config: Record<string, unknown>; postprocess_version: string; linked_ocr_block_ids: string[]; review_status?: string; review_notes?: string | null; }
+interface VisualRunPageItem { id: string; run_id: string; page_number: number; status: string; engine: string | null; engine_version: string | null; checkpoint_sha256: string | null; device: string | null; source_page_width_points: number | null; source_page_height_points: number | null; render_width_px: number | null; render_height_px: number | null; render_dpi: number | null; page_rotation: number | null; transform: Record<string, unknown>; integrity_score: number | null; localization_artifact_id: string | null; reliability_artifact_id: string | null; noiseprint_artifact_id: string | null; diagnostics: Record<string, unknown>; regions: VisualCandidateRegionItem[]; }
+interface VisualRun { id: string; document_id: string; status: string; result: { run_kind?: 'new' | 'retry'; page_count?: number; engine?: EngineHealth | null; checks?: Array<{ check_type: string; status: string; algorithm: string; pages_analyzed?: number[]; metrics?: Record<string, unknown>; skipped?: Array<{ reason?: string }> }>; observations?: Array<{ finding_id: string; investigation_id: string; document_id: string; page_number: number; regions: Array<{ x0: number; y0: number; x1: number; y1: number }>; check_type: string; algorithm: string; metrics: Record<string, unknown>; explanation: string; limitations: string; evidence_ref: EvidenceRef & { bounding_box?: Record<string, number>; regions?: Array<Record<string, number>> }; review_status: string }> }; error_detail?: string | null; created_at: string; started_at?: string | null; completed_at?: string | null; }
 
 const SAMPLE_TEMPLATE = `[
   {
@@ -228,7 +232,13 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
   const [visualPage, setVisualPage] = useState(1);
   const [visualLayer, setVisualLayer] = useState('all');
   const [visualZoom, setVisualZoom] = useState(100);
-  const [, setVisualImageReady] = useState(false);
+  const [visualMapOpacity, setVisualMapOpacity] = useState(0.65);
+  const [visualImageSize, setVisualImageSize] = useState({ width: 0, height: 0 });
+  const [visualCompareMode, setVisualCompareMode] = useState(false);
+  const [visualPan, setVisualPan] = useState({ x: 0, y: 0 });
+  const [panStart, setPanStart] = useState<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const [selectedVisualRegionId, setSelectedVisualRegionId] = useState('');
+  const [selectedOcrBlockId, setSelectedOcrBlockId] = useState('');
   const visualRunsByDocument = useMemo(() => {
     const grouped = new Map<string, VisualRun[]>();
     for (const run of visualRuns.data?.items ?? []) grouped.set(run.document_id, [...(grouped.get(run.document_id) ?? []), run]);
@@ -244,7 +254,55 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
   const visualDocument = visualDocuments.data?.find((doc) => doc.id === visualDocumentId);
   const documentVisualHistory = visualRunsByDocument.get(visualDocumentId) ?? [];
   const latestVisualRun = documentVisualHistory[0];
-  const visualPageCount = Math.max(1, latestVisualRun?.result.page_count ?? 1);
+  const visualEngine = useQuery({
+    queryKey: ['visual-engine', investigationId],
+    queryFn: () => apiRequest<EngineHealth>(`/investigations/${investigationId}/visual-forensics-engine`),
+    enabled: section === 'visual',
+    retry: false,
+  });
+  const extractionRuns = useQuery({
+    queryKey: ['visual-extraction-runs', investigationId, visualDocumentId],
+    queryFn: () => apiRequest<{ items: Array<{ id: string; status: string }> }>(`/investigations/${investigationId}/documents/${visualDocumentId}/extraction-runs`),
+    enabled: section === 'visual' && Boolean(visualDocumentId), retry: false,
+  });
+  const extractionRunId = extractionRuns.data?.items.find((run) => run.status === 'completed')?.id;
+  const extractionRun = useQuery({
+    queryKey: ['visual-extraction-run', investigationId, visualDocumentId, extractionRunId],
+    queryFn: () => apiRequest<{ pages: Array<{ page_number: number; width: number | null; height: number | null }> }>(`/investigations/${investigationId}/documents/${visualDocumentId}/extraction-runs/${extractionRunId}`),
+    enabled: section === 'visual' && Boolean(extractionRunId), retry: false,
+  });
+  const visualPageCount = Math.max(1, latestVisualRun?.result.page_count ?? extractionRun.data?.pages.length ?? 1);
+  const visualRunPages = useQuery({
+    queryKey: ['visual-run-pages', investigationId, latestVisualRun?.id],
+    queryFn: () => apiRequest<{ items: VisualRunPageItem[] }>(`/investigations/${investigationId}/visual-analysis-runs/${latestVisualRun!.id}/pages`),
+    enabled: section === 'visual' && Boolean(latestVisualRun?.id),
+    retry: false,
+  });
+  const enginePage = visualRunPages.data?.items.find((page) => page.page_number === visualPage);
+  const activeMapArtifactId = visualLayer === 'localization' ? enginePage?.localization_artifact_id ?? null
+    : visualLayer === 'reliability' ? enginePage?.reliability_artifact_id ?? null : null;
+  const engineMapImage = useQuery({
+    queryKey: ['visual-artifact', investigationId, activeMapArtifactId],
+    queryFn: () => apiBlob(`/investigations/${investigationId}/visual-analysis-artifacts/${activeMapArtifactId}`),
+    enabled: section === 'visual' && Boolean(activeMapArtifactId),
+    retry: false,
+  });
+  const localizationMapImage = useQuery({
+    queryKey: ['visual-artifact', investigationId, enginePage?.localization_artifact_id],
+    queryFn: () => apiBlob(`/investigations/${investigationId}/visual-analysis-artifacts/${enginePage!.localization_artifact_id}`),
+    enabled: section === 'visual' && visualCompareMode && Boolean(enginePage?.localization_artifact_id), retry: false,
+  });
+  const reliabilityMapImage = useQuery({
+    queryKey: ['visual-artifact', investigationId, enginePage?.reliability_artifact_id],
+    queryFn: () => apiBlob(`/investigations/${investigationId}/visual-analysis-artifacts/${enginePage!.reliability_artifact_id}`),
+    enabled: section === 'visual' && visualCompareMode && Boolean(enginePage?.reliability_artifact_id), retry: false,
+  });
+  const engineMapUrl = useMemo(() => engineMapImage.data && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(engineMapImage.data) : '', [engineMapImage.data]);
+  useEffect(() => () => { if (engineMapUrl) URL.revokeObjectURL(engineMapUrl); }, [engineMapUrl]);
+  const localizationMapUrl = useMemo(() => localizationMapImage.data && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(localizationMapImage.data) : '', [localizationMapImage.data]);
+  useEffect(() => () => { if (localizationMapUrl) URL.revokeObjectURL(localizationMapUrl); }, [localizationMapUrl]);
+  const reliabilityMapUrl = useMemo(() => reliabilityMapImage.data && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(reliabilityMapImage.data) : '', [reliabilityMapImage.data]);
+  useEffect(() => () => { if (reliabilityMapUrl) URL.revokeObjectURL(reliabilityMapUrl); }, [reliabilityMapUrl]);
   const visualOcr = useQuery({
     queryKey: ['visual-ocr', investigationId, visualDocumentId],
     queryFn: () => apiRequest<{ blocks: VisualOcrBlock[]; recognized_text: string }>(`/investigations/${investigationId}/documents/${visualDocumentId}/ocr`),
@@ -260,9 +318,13 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
   });
   const visualPreviewUrl = useMemo(() => visualPreview.data && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(visualPreview.data) : '', [visualPreview.data]);
   useEffect(() => () => { if (visualPreviewUrl) URL.revokeObjectURL(visualPreviewUrl); }, [visualPreviewUrl]);
-  useEffect(() => { setVisualImageReady(false); }, [visualPreviewUrl]);
+  useEffect(() => { setVisualImageSize({ width: 0, height: 0 }); }, [visualPreviewUrl]);
   useEffect(() => { setVisualPage((page) => Math.min(page, visualPageCount)); }, [visualPageCount]);
   const visualObservations = (latestVisualRun?.result.observations ?? []).filter((observation) => observation.page_number === visualPage);
+  const ocrPageGeometry = extractionRun.data?.pages.find((page) => page.page_number === visualPage);
+  const localizationAvailable = Boolean(enginePage?.localization_artifact_id);
+  const reliabilityAvailable = Boolean(enginePage?.reliability_artifact_id);
+  const canCompareMaps = localizationAvailable && reliabilityAvailable;
   const runVisual = useMutation({
     mutationFn: (documentId: string) => apiRequest<VisualRun>(`/investigations/${investigationId}/documents/${documentId}/visual-analysis-runs`, { method: 'POST' }),
     onSuccess: async (run) => {
@@ -274,6 +336,11 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
       ]);
     },
     onError: (reason) => setVisualError(reason instanceof ApiError ? reason.message : 'Visual analysis request failed.'),
+  });
+  const reviewVisualRegion = useMutation({
+    mutationFn: ({ id, status, review_notes }: { id: string; status: string; review_notes: string }) => apiRequest<VisualCandidateRegionItem>(`/investigations/${investigationId}/visual-candidate-regions/${id}`, { method: 'PATCH', body: JSON.stringify({ status, review_notes: review_notes || null }) }),
+    onSuccess: async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ['visual-run-pages', investigationId] }), queryClient.invalidateQueries({ queryKey: ['audit', investigationId] })]); },
+    onError: (reason) => setVisualError(reason instanceof ApiError ? reason.message : 'Region disposition could not be saved.'),
   });
 
   const review = useMutation({
@@ -442,6 +509,7 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
     { check_type: 'copy_move', title: 'Repeated visual regions', Icon: ImageIcon },
     { check_type: 'compression_resampling', title: 'Local texture / JPEG block-boundary variation', Icon: AlignLeft },
     { check_type: 'pdf_objects', title: 'Overlay and transparency indicators', Icon: Layers3 },
+    { check_type: 'trufor_engine', title: 'TruFor model localization (isolated worker)', Icon: Cpu },
   ];
   const pdfVisualSource = visualDocument?.content_type === 'application/pdf';
   const visualRasterSource = Boolean(visualDocument?.content_type.startsWith('image/'));
@@ -536,50 +604,87 @@ export default function InvestigationAnalysis({ investigationId, section }: { in
           <button className="button primary" type="button" disabled={!visualDocument || runVisual.isPending || ['queued', 'processing'].includes(visualDocument.processing_status)} onClick={() => visualDocument && runVisual.mutate(visualDocument.id)}><Eye size={15}/>{runVisualButtonLabel}</button>
         </header>
         {visualError && <div className="auth-error" role="alert">{visualError} <button className="text-link" type="button" onClick={() => setVisualError('')}>Dismiss</button></div>}
+        <section className="panel visual-engine-panel" aria-label="TruFor model engine status">
+          <div className="panel-head"><div><h3>Model-assisted layer · TruFor</h3><p>RGB + Noiseprint++ fusion (Guillaro et al., CVPR 2023) served by an isolated inference worker. Model outputs are candidate signals, never authenticity verdicts.</p></div><span className={`visual-run-status ${visualEngine.data?.available ? 'status-completed' : 'status-idle'}`}>{visualEngine.data?.available ? 'ENGINE REACHABLE' : 'ENGINE UNAVAILABLE'}</span></div>
+          {visualEngine.isLoading ? <p role="status">Checking engine status…</p> : visualEngine.isError ? <p role="alert">Engine status could not be checked. No model output is displayed.</p> : <>
+            <ul className="visual-engine-meta">
+              <li>Feature flag: <b>{visualEngine.data?.feature_enabled ? 'enabled' : 'disabled (VISUAL_FORENSICS_ENABLED)'}</b></li>
+              <li>Availability: <b>{visualEngine.data?.available ? 'worker reachable' : 'no worker configured or reachable'}</b></li>
+              <li>Model version: {visualEngine.data?.model_version || 'not reported'}</li>
+              <li>Checkpoint SHA-256: {visualEngine.data?.checkpoint_sha256 ? <code>{visualEngine.data.checkpoint_sha256.slice(0, 16)}…</code> : 'not reported'}</li>
+              <li>Device: {visualEngine.data?.device || 'not reported'}</li>
+            </ul>
+            <p className="muted">{visualEngine.data?.reason || 'No TruFor model output exists for this workspace. Nothing here is fabricated; the deterministic checks above remain the only automated analysis.'}</p>
+          </>}
+          {visualRunPages.data && (visualRunPages.data.items.length ? <div className="visual-engine-pages" aria-label="Engine page results">
+            {visualRunPages.data.items.map((page) => <article className="visual-engine-page" key={page.id}>
+              <div className="visual-engine-page-head"><b>Page {page.page_number}</b><span className={`badge ${page.status === 'completed' ? 'green' : page.status === 'partial' ? 'amber' : 'red'}`}>{page.status}</span>{page.integrity_score != null && <span className="badge blue" title="Exact official model output; not a calibrated fraud probability">Integrity score (model output) {page.integrity_score.toFixed(3)}</span>}</div>
+              <small>{page.engine || 'trufor'} {page.engine_version ? `v${page.engine_version}` : ''} · {page.device || 'device unreported'} · rendered {page.render_width_px ?? '?'}×{page.render_height_px ?? '?'} px at {page.render_dpi ?? '?'} DPI · mapped to {page.source_page_width_points ?? '?'}×{page.source_page_height_points ?? '?'} pt</small>
+              <small>{page.localization_artifact_id ? 'Localization map available · select the Localization layer to view it' : 'No localization map for this page'}</small>
+              {page.diagnostics?.error_code != null && <p role="status">Page diagnostics: {String(page.diagnostics.error_code)} — {String(page.diagnostics.error_detail ?? '')}</p>}
+              {page.page_number === visualPage && page.regions.length > 0 && <div className="table-wrap"><table className="dashboard-table"><thead><tr><th>REGION</th><th>BBOX (PDF points)</th><th>BBOX (pixels)</th><th>MEAN LOCALIZATION</th><th>POST-PROCESSING</th><th>LINKED OCR BLOCKS</th></tr></thead><tbody>{page.regions.map((region) => <tr key={region.id}><td>Candidate {region.region_index + 1}</td><td className="mono">{[region.bbox_pdf_points.x0, region.bbox_pdf_points.y0, region.bbox_pdf_points.x1, region.bbox_pdf_points.y1].map((value) => value.toFixed(1)).join(', ')}</td><td className="mono">{[region.bbox_pixel.x0, region.bbox_pixel.y0, region.bbox_pixel.x1, region.bbox_pixel.y1].map((value) => Math.round(value)).join(', ')}</td><td>{region.mean_localization_score == null ? 'unreported' : region.mean_localization_score.toFixed(3)}</td><td className="mono">{region.postprocess_version}</td><td>{region.linked_ocr_block_ids.length ? region.linked_ocr_block_ids.join(', ') : 'none (navigation link only)'}</td></tr>)}</tbody></table><p className="muted">Region scores are model outputs for candidate review, not evidence of manipulation. Linked OCR blocks are a navigation aid, not proof the text was altered.</p></div>}
+            </article>)}
+          </div> : <p className="muted">No engine page records exist for the latest run; no model output was produced.</p>)}
+        </section>
         {visualDocuments.isLoading ? <div className="visual-forensics-grid"><div className="visual-canvas-skeleton" role="status">Loading source documents…</div><div className="visual-check-panel-skeleton"/></div> : visualDocuments.isError ? <div className="panel" role="alert">Documents could not be loaded. <button type="button" className="text-link" onClick={() => void visualDocuments.refetch()}>Retry</button></div> : (visualDocuments.data?.length ?? 0) === 0 ? <div className="panel visual-empty-state"><FileImage size={23}/><h3>No stored source documents</h3><p>Add a document to this investigation before starting visual analysis.</p><Link className="button secondary small" to={`/investigations/${investigationId}`}>Open investigation documents</Link></div> : <div className="visual-forensics-grid">
           <section className="visual-canvas-panel" aria-label="Source document canvas">
             <div className="visual-canvas-toolbar">
               <div className="visual-canvas-document"><FileText size={15}/><label className="sr-only" htmlFor="visual-document-select">Choose source document</label><select id="visual-document-select" value={visualDocumentId} onChange={(event) => { setVisualDocumentId(event.target.value); setVisualPage(1); setVisualZoom(100); }}>{visualDocuments.data?.map((document) => <option value={document.id} key={document.id}>{document.filename}</option>)}</select></div>
-              <label className="visual-layer-select"><Layers3 size={14}/><span className="sr-only">Visible evidence layers</span><select aria-label="Visible evidence layers" value={visualLayer} onChange={(event) => setVisualLayer(event.target.value)}><option value="all">All layers</option><option value="visual">Visual observations</option><option value="ocr">OCR regions</option></select></label>
+              <label className="visual-layer-select"><Layers3 size={14}/><span className="sr-only">Visible evidence layers</span><select aria-label="Visible evidence layers" value={visualLayer} onChange={(event) => setVisualLayer(event.target.value)}><option value="all">All available layers</option><option value="original">Original only</option><option value="visual">Visual observations</option><option value="ocr">OCR regions</option><option value="localization" disabled={!localizationAvailable}>Localization map (model)</option><option value="reliability" disabled={!reliabilityAvailable}>Reliability map (model)</option></select></label>
+              <button type="button" className={`button secondary small ${visualCompareMode ? 'active' : ''}`} disabled={!canCompareMaps} title={canCompareMaps ? 'Compare original, localization, and reliability maps with shared zoom and page navigation' : 'Comparison is available only when both model artifacts exist for this page'} onClick={() => setVisualCompareMode((value) => !value)}>Compare maps</button>
               <div className="visual-canvas-pagination"><button type="button" aria-label="Previous source page" disabled={visualPage <= 1} onClick={() => setVisualPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15}/></button><span>Page {visualPage} of {visualPageCount}</span><button type="button" aria-label="Next source page" disabled={visualPage >= visualPageCount} onClick={() => setVisualPage((page) => Math.min(visualPageCount, page + 1))}><ChevronRight size={15}/></button></div>
             </div>
             <div className="visual-source-meta"><span><i/> {visualDocument?.filename}</span><span>{visualDocument?.id.slice(0, 12)} · {visualDocument?.sha256 ? `${visualDocument.sha256.slice(0, 10)}…` : 'Source hash unavailable'}</span></div>
-            <div className="visual-canvas-viewport">
-              {visualPreview.isLoading ? <div className="visual-canvas-skeleton" role="status">Rendering stored source page…</div> : visualPreview.isError ? <div className="visual-canvas-skeleton" role="alert">The stored source preview is unavailable. Analysis can still run against the stored original.</div> : visualPreviewUrl ? <div className="visual-canvas-page" style={{ width: `${visualZoom}%` }}>
-                <img id="visual-source-image" src={visualPreviewUrl} alt={`Original source ${visualDocument?.filename}, page ${visualPage}`} onLoad={() => setVisualImageReady(true)}/>
+            <div className={`visual-canvas-viewport ${visualCompareMode ? 'is-pannable' : ''}`} onWheel={(event) => { if (visualCompareMode && event.ctrlKey) { event.preventDefault(); setVisualZoom((zoom) => Math.max(50, Math.min(200, zoom + (event.deltaY < 0 ? 10 : -10)))); } }} onPointerDown={(event) => { if (!visualCompareMode || event.button !== 0) return; event.currentTarget.setPointerCapture(event.pointerId); setPanStart({ x: event.clientX, y: event.clientY, panX: visualPan.x, panY: visualPan.y }); }} onPointerMove={(event) => { if (panStart) setVisualPan({ x: panStart.panX + event.clientX - panStart.x, y: panStart.panY + event.clientY - panStart.y }); }} onPointerUp={() => setPanStart(null)} onPointerCancel={() => setPanStart(null)}>
+              {visualPreview.isLoading ? <div className="visual-canvas-skeleton" role="status">Rendering stored source page…</div> : visualPreview.isError ? <div className="visual-canvas-skeleton" role="alert">The stored source preview is unavailable. Analysis can still run against the stored original.</div> : visualPreviewUrl ? <div className={`visual-canvas-page ${visualCompareMode ? 'is-comparison' : ''}`} style={{ width: `${visualZoom}%` }}>
+                {visualCompareMode ? <div className="visual-comparison-grid">{([{ kind: 'original', title: 'Original image', src: visualPreviewUrl }, { kind: 'localization', title: 'Localization map', src: localizationMapUrl }, { kind: 'reliability', title: 'Reliability map', src: reliabilityMapUrl }] as const).map(({ kind, title, src }) => <figure key={kind} className="visual-comparison-panel"><figcaption>{title}</figcaption><div className="visual-comparison-image" style={{ transform: `translate(${visualPan.x}px, ${visualPan.y}px) scale(${visualZoom / 100})` }}>{src ? <img src={src} alt={`${title} page ${visualPage}`} style={{ opacity: kind === 'original' ? 1 : visualMapOpacity }} onLoad={(event) => kind === 'original' && setVisualImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}/> : <span role="status">{kind === 'localization' ? localizationMapImage.isError ? 'Localization artifact unavailable' : 'Loading localization map…' : kind === 'reliability' ? reliabilityMapImage.isError ? 'Reliability artifact unavailable' : 'Loading reliability map…' : 'Source unavailable'}</span>}</div><small>Page {visualPage} · synchronized zoom {visualZoom}%</small></figure>)}</div> : <>
+                <img id="visual-source-image" src={visualPreviewUrl} alt={`Original source ${visualDocument?.filename}, page ${visualPage}`} onLoad={(event) => setVisualImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}/>
+                {activeMapArtifactId && (engineMapImage.isLoading ? <div className="visual-model-map-loading" role="status">Loading model map artifact…</div> : engineMapImage.isError ? <div className="visual-model-map-error" role="alert">The stored model map artifact could not be loaded. No synthetic map is drawn.</div> : engineMapUrl ? <img className="visual-model-map-overlay" src={engineMapUrl} alt={`${visualLayer === 'localization' ? 'Localization' : 'Reliability'} map (model output) for page ${visualPage}`} style={{ opacity: visualMapOpacity }} aria-label={`${visualLayer} map overlay`}/> : null)}
+                {activeMapArtifactId && <p className="visual-model-map-note">Model map display is resized to the page; the stored artifact with its recorded dimensions is authoritative.</p>}
                 {(visualLayer === 'all' || visualLayer === 'visual') && visualObservations.flatMap((observation) => observation.regions.map((region, index) => {
-                  const scale = pdfVisualSource ? 1.5 : 1;
-                  const currentImage = document.getElementById('visual-source-image') as HTMLImageElement | null;
-                  const width = currentImage?.naturalWidth ?? 0, height = currentImage?.naturalHeight ?? 0;
-                  if (!width || !height) return null;
-                  return <div key={`${observation.finding_id}-${index}`} className="visual-region visual-region-anomaly" title={`${observation.check_type.replaceAll('_', ' ')} · source region ${index + 1}`} style={{ left: `${region.x0 * scale / width * 100}%`, top: `${region.y0 * scale / height * 100}%`, width: `${(region.x1 - region.x0) * scale / width * 100}%`, height: `${(region.y1 - region.y0) * scale / height * 100}%` }}><span>{observation.check_type.replaceAll('_', ' ')}</span></div>;
+                  const pageWidth = enginePage?.source_page_width_points;
+                  const pageHeight = enginePage?.source_page_height_points;
+                  if (!visualImageSize.width || !visualImageSize.height || !pageWidth || !pageHeight) return null;
+                  return <div key={`${observation.finding_id}-${index}`} className="visual-region visual-region-anomaly" title={`${observation.check_type.replaceAll('_', ' ')} · source region ${index + 1}`} style={{ left: `${region.x0 / pageWidth * 100}%`, top: `${region.y0 / pageHeight * 100}%`, width: `${(region.x1 - region.x0) / pageWidth * 100}%`, height: `${(region.y1 - region.y0) / pageHeight * 100}%` }}><span>{observation.check_type.replaceAll('_', ' ')}</span></div>;
                 }))}
                 {(visualLayer === 'all' || visualLayer === 'ocr') && (visualOcr.data?.blocks ?? []).filter((block) => (block.page_index ?? 0) === visualPage - 1).map((block) => {
                   const rect = visualBounds(block.engine_bbox);
-                  const currentImage = document.getElementById('visual-source-image') as HTMLImageElement | null;
-                  const width = currentImage?.naturalWidth ?? 0, height = currentImage?.naturalHeight ?? 0;
-                  const scale = pdfVisualSource ? 1.5 : 1;
-                  if (!rect || !width || !height) return null;
-                  return <div key={block.block_id} className="visual-region visual-region-ocr" title={`${block.block_id} · ${block.text}`} style={{ left: `${rect.left * scale / width * 100}%`, top: `${rect.top * scale / height * 100}%`, width: `${rect.width * scale / width * 100}%`, height: `${rect.height * scale / height * 100}%` }}><span>{block.block_id}</span></div>;
+                  const pageWidth = ocrPageGeometry?.width, pageHeight = ocrPageGeometry?.height;
+                  if (!rect || !pageWidth || !pageHeight || !visualImageSize.width || !visualImageSize.height) return null;
+                  const selected = selectedOcrBlockId === block.block_id;
+                  return <button type="button" key={block.block_id} className={`visual-region visual-region-ocr ${selected ? 'is-selected' : ''}`} title={`${block.block_id} · ${block.text}`} onClick={() => setSelectedOcrBlockId(block.block_id)} style={{ left: `${rect.left / pageWidth * 100}%`, top: `${rect.top / pageHeight * 100}%`, width: `${rect.width / pageWidth * 100}%`, height: `${rect.height / pageHeight * 100}%` }}><span>{block.block_id}</span></button>;
                 })}
+                {(visualLayer === 'all' || visualLayer === 'localization') && (enginePage?.regions ?? []).map((region) => {
+                  const box = region.bbox_pdf_points;
+                  const pageWidth = enginePage?.source_page_width_points, pageHeight = enginePage?.source_page_height_points;
+                  if (!pageWidth || !pageHeight || !visualImageSize.width || !visualImageSize.height) return null;
+                  return <button type="button" key={`model-${region.id}`} className={`visual-region visual-region-model ${selectedVisualRegionId === region.id ? 'is-selected' : ''}`} title={`Candidate region ${region.region_index + 1} · mean localization ${region.mean_localization_score ?? 'unreported'} · post-processing ${region.postprocess_version}`} onClick={() => setSelectedVisualRegionId(region.id)} style={{ left: `${box.x0 / pageWidth * 100}%`, top: `${box.y0 / pageHeight * 100}%`, width: `${(box.x1 - box.x0) / pageWidth * 100}%`, height: `${(box.y1 - box.y0) / pageHeight * 100}%` }}><span>candidate {region.region_index + 1}</span></button>;
+                })}
+              </>}
               </div> : null}
             </div>
-            <div className="visual-canvas-footer"><span>{pdfVisualSource ? 'PDF page preview rendered from the stored original' : 'Original image bytes · no synthetic preview'}</span><div className="visual-zoom-controls"><button type="button" aria-label="Zoom out source page" onClick={() => setVisualZoom((zoom) => Math.max(70, zoom - 10))}><ZoomOut size={14}/></button><span>{visualZoom}%</span><button type="button" aria-label="Zoom in source page" onClick={() => setVisualZoom((zoom) => Math.min(150, zoom + 10))}><ZoomIn size={14}/></button><button type="button" onClick={() => setVisualZoom(100)}>Fit</button></div></div>
+            <div className="visual-canvas-footer"><span>{pdfVisualSource ? 'PDF page preview rendered from the stored original' : 'Original image bytes · no synthetic preview'}</span><div className="visual-canvas-footer-controls">{activeMapArtifactId && <label className="visual-map-opacity"><span className="sr-only">Model map opacity</span><input type="range" min={0.1} max={1} step={0.05} value={visualMapOpacity} aria-label="Model map overlay opacity" onChange={(event) => setVisualMapOpacity(Number(event.target.value))}/><span>{Math.round(visualMapOpacity * 100)}%</span></label>}<div className="visual-zoom-controls"><button type="button" aria-label="Zoom out source page" onClick={() => setVisualZoom((zoom) => Math.max(70, zoom - 10))}><ZoomOut size={14}/></button><span>{visualZoom}%</span><button type="button" aria-label="Zoom in source page" onClick={() => setVisualZoom((zoom) => Math.min(150, zoom + 10))}><ZoomIn size={14}/></button><button type="button" onClick={() => setVisualZoom(100)}>Fit</button></div></div></div>
+            {selectedVisualRegionId && enginePage?.regions.find((region) => region.id === selectedVisualRegionId) && (() => { const region = enginePage.regions.find((item) => item.id === selectedVisualRegionId)!; return <section className="visual-region-inspector" aria-label="Selected region details"><div className="panel-head"><div><p className="visual-review-eyebrow">Region inspector</p><h3>Candidate {region.region_index + 1} · page {visualPage}</h3></div><span className="badge amber">{region.review_status ?? 'needs_review'}</span></div><p>Localization mean {formatMetric(region.mean_localization_score)} · maximum {formatMetric(region.max_localization_score)} · reliability {formatMetric(region.mean_reliability_value)}</p><small>Pixel bounds: {JSON.stringify(region.bbox_pixel)} · PDF points: {JSON.stringify(region.bbox_pdf_points)}</small><h4>Associated OCR blocks</h4>{region.linked_ocr_block_ids.length ? region.linked_ocr_block_ids.map((blockId) => { const block = visualOcr.data?.blocks.find((item) => item.block_id === blockId); return <div className="visual-linked-ocr" key={blockId}><button className="text-link" type="button" onClick={() => { setSelectedOcrBlockId(blockId); setVisualLayer('ocr'); }}>{blockId}: {block?.text || 'OCR block text unavailable'}</button>{block && <Link to={evidenceUrl(investigationId, { document_id: visualDocumentId, filename: visualDocument?.filename, page_number: visualPage, block_id: blockId })}>Open source evidence</Link>}</div>; }) : <p className="muted">No verified OCR association is stored for this region.</p>}<label className="auth-label">Review note<textarea aria-label="Visual candidate review note" defaultValue={region.review_notes ?? ''} maxLength={4000} rows={2} onChange={(event) => setNotes((current) => ({ ...current, [region.id]: event.target.value }))}/></label><div className="create-actions">{(['accepted', 'needs_review', 'rejected', 'dismissed'] as const).map((status) => <button className="button secondary small" type="button" key={status} disabled={reviewVisualRegion.isPending} onClick={() => reviewVisualRegion.mutate({ id: region.id, status, review_notes: notes[region.id] ?? region.review_notes ?? '' })}>{status.replaceAll('_', ' ')}</button>)}</div></section>; })()}
           </section>
           <aside className="visual-check-panel" aria-label="Visual check availability">
             <div className="visual-check-panel-heading"><div><p className="visual-review-eyebrow">Measured checks</p><h3>Visual check availability</h3><p>{latestVisualRun ? `${latestVisualRun.status} · ${latestVisualRun.result.observations?.length ?? 0} candidate observation(s)` : 'No checks run for this source yet.'}</p></div><span className={`visual-run-status status-${latestVisualRun?.status ?? 'idle'}`}>{latestVisualRun ? latestVisualRun.status : 'NO CHECKS RUN'}</span></div>
             <div className="visual-check-list">{visualCheckSpecs.map(({ check_type, title, Icon }) => {
               const recorded = latestVisualRun?.result.checks?.find((check) => check.check_type === check_type);
-              const sourceSupports = check_type === 'font_baseline' || check_type === 'pdf_objects' ? pdfVisualSource
+              const sourceSupports = check_type === 'trufor_engine' ? pdfVisualSource
+                : check_type === 'font_baseline' || check_type === 'pdf_objects' ? pdfVisualSource
                 : check_type === 'copy_move' ? Boolean(pdfVisualSource || visualRasterSource)
                   : Boolean(visualRasterSource);
+              const unavailableNote = check_type === 'trufor_engine'
+                ? 'The isolated TruFor inference worker is not deployed, so no model output exists.'
+                : check_type === 'compression_resampling' ? 'This PDF page raster does not isolate source image compression.' : 'This check requires a PDF source.';
               const status = recorded?.status ?? (sourceSupports ? 'not_run' : 'unavailable');
               const statusText = recorded ? status.replaceAll('_', ' ') : sourceSupports ? 'Ready · not run' : 'Unavailable for this source';
               const tone = status === 'executed' ? 'green' : status === 'partial' || status === 'unavailable' ? 'amber' : status === 'failed' ? 'red' : 'blue';
-              return <article className="visual-check-item" key={check_type}><span className="visual-check-icon"><Icon size={15}/></span><div className="visual-check-copy"><b>{title}</b><small>{recorded?.algorithm ?? (sourceSupports ? 'Available for this source type.' : check_type === 'compression_resampling' ? 'This PDF page raster does not isolate source image compression.' : 'This check requires a PDF source.')}</small>{recorded?.skipped?.map((skip, index) => <small className="visual-check-reason" key={index}>{skip.reason}</small>)}{recorded?.metrics && <small className="visual-check-metric">{Object.entries(recorded.metrics).filter(([, value]) => typeof value === 'number').slice(0, 3).map(([key, value]) => `${key.replaceAll('_', ' ')} ${value}`).join(' · ')}</small>}</div><span className={`visual-check-badge badge ${tone}`}>{statusText}</span></article>;
+              return <article className="visual-check-item" key={check_type}><span className="visual-check-icon"><Icon size={15}/></span><div className="visual-check-copy"><b>{title}</b><small>{recorded?.algorithm ?? (sourceSupports ? 'Available for this source type.' : unavailableNote)}</small>{recorded?.skipped?.map((skip, index) => <small className="visual-check-reason" key={index}>{skip.reason}</small>)}{recorded?.metrics && <small className="visual-check-metric">{Object.entries(recorded.metrics).filter(([, value]) => typeof value === 'number').slice(0, 3).map(([key, value]) => `${key.replaceAll('_', ' ')} ${value}`).join(' · ')}</small>}</div><span className={`visual-check-badge badge ${tone}`}>{statusText}</span></article>;
             })}</div>
             <div className="visual-observation-summary"><div className="visual-observation-count"><span>Candidate observations</span><b>{latestVisualRun?.result.observations?.length ?? 0}</b></div>{latestVisualRun?.status === 'failed' ? <p role="alert">Analysis failed. {latestVisualRun.error_detail || ''}</p> : !latestVisualRun ? <p>Run checks to measure the stored source. No observation is inferred before analysis.</p> : (latestVisualRun.result.observations?.length ?? 0) > 0 ? <p>Candidate anomalies detected by the implemented checks. Review each source region and its measured evidence before drawing conclusions.</p> : latestVisualRun.status === 'partial' ? <p>Partial coverage: no candidate anomalies were detected by the checks that ran. One or more checks were unavailable for this source.</p> : <p>No candidate anomalies detected by the implemented checks. This does not establish document authenticity.</p>}</div>
             {latestVisualRun?.result.observations?.length ? <div className="visual-observation-list" aria-label="Candidate visual observations">{visualObservations.map((item) => <article key={item.finding_id}><div><b>{item.check_type.replaceAll('_', ' ')} · page {item.page_number}</b><span className="badge blue">{item.review_status}</span></div><p>{item.explanation}</p><small>{item.algorithm}</small><Link className="text-link" to={`/investigations/${investigationId}?doc=${item.document_id}&page=${item.page_number}${item.evidence_ref.block_id ? `&block=${encodeURIComponent(item.evidence_ref.block_id)}` : ''}${item.regions[0] ? `&x0=${item.regions[0].x0}&y0=${item.regions[0].y0}&x1=${item.regions[0].x1}&y1=${item.regions[0].y1}` : ''}`}>Open source region</Link></article>)}</div> : null}
+            {selectedOcrBlockId && <article className="visual-selected-ocr"><div className="panel-head"><b>Selected OCR block</b><button className="text-link" type="button" onClick={() => setSelectedOcrBlockId('')}>Clear</button></div><p>{visualOcr.data?.blocks.find((block) => block.block_id === selectedOcrBlockId)?.text ?? 'OCR block unavailable'}</p><Link to={evidenceUrl(investigationId, { document_id: visualDocumentId, filename: visualDocument?.filename, page_number: visualPage, block_id: selectedOcrBlockId })}>Open in evidence viewer</Link></article>}
             <div className="visual-review-boundary"><ShieldAlert size={15}/><span>These checks surface measurable signals for review. They do not determine authenticity, cause, or intent.</span></div>
           </aside>
         </div>}

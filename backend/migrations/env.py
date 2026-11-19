@@ -10,7 +10,7 @@ from app.db.base import Base
 from app.models.entities import (  # noqa: F401
     ActivityEvent, AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, Finding,
     Investigation, OCRResult, OcrEvaluationRun, PasswordResetToken, RefreshSession,
-    RelationshipAnalysis, TimelineEvent, User, VisualAnalysisRun,
+    RelationshipAnalysis, TimelineEvent, User, VisualAnalysisArtifact, VisualAnalysisPage, VisualAnalysisRun, VisualCandidateRegion,
 )
 
 config = context.config
