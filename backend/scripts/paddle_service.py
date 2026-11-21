@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".pdf", ".tif", ".tiff"}
@@ -37,11 +38,76 @@ def _input_path(path: str) -> tuple[str, str | None]:
     return temporary, temporary
 
 
+def _render_pdf_pages(path: str, dpi: int = 144) -> tuple[str, str, list[dict]]:
+    """Rasterize PDF pages ourselves so OCR boxes have a known pixel space."""
+    import fitz
+
+    if Path(path).stat().st_size > 25 * 1024 * 1024:
+        raise ValueError("PDF exceeds the OCR source byte limit")
+    directory = tempfile.mkdtemp(prefix="docforensiq-ocr-")
+    metadata: list[dict] = []
+    try:
+        with fitz.open(path) as document:
+            if document.needs_pass:
+                raise ValueError("Encrypted PDF cannot be rasterized without a password")
+            if document.page_count == 0:
+                raise ValueError("PDF contains no pages")
+            if document.page_count > 250:
+                raise ValueError("PDF exceeds the OCR page limit of 250")
+            total_pixels = 0
+            scale = dpi / 72
+            for index in range(document.page_count):
+                page = document.load_page(index)
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                total_pixels += pixmap.width * pixmap.height
+                if total_pixels > 50_000_000:
+                    raise ValueError("PDF exceeds the OCR raster pixel limit")
+                image_path = os.path.join(directory, f"page-{index + 1:04d}.png")
+                pixmap.save(image_path)
+                rect = page.rect
+                metadata.append({
+                    "page_number": index + 1,
+                    "width": pixmap.width,
+                    "height": pixmap.height,
+                    "bbox_space": "rendered_pixels_top_left",
+                    "geometry": {
+                        "mapping_version": "ocr_pixel_to_pdf_v1",
+                        "render_width_px": pixmap.width,
+                        "render_height_px": pixmap.height,
+                        "page_width_points": float(rect.width),
+                        "page_height_points": float(rect.height),
+                        "origin_x_points": float(rect.x0),
+                        "origin_y_points": float(rect.y0),
+                        "page_rotation": int(page.rotation),
+                        "render_dpi": dpi,
+                        "renderer": f"PyMuPDF/{fitz.VersionBind}",
+                    },
+                })
+        return directory, directory, metadata
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
 def _enabled(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cleanup_temporary(path: str | None) -> None:
+    """Remove either a suffix-adjusted input file or a rendered-page directory."""
+    if not path:
+        return
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except OSError as exc:
+        # Cleanup failure must not turn successful OCR into a worker crash.
+        print(f"OCR temporary cleanup failed ({type(exc).__name__})", file=sys.stderr)
 
 
 def _page_metadata(path: str, result: list) -> list[dict]:
@@ -96,17 +162,28 @@ def main() -> None:
         try:
             request = json.loads(line)
             input_path, temporary = _input_path(request["path"])
-            results = list(pipeline.predict(input=input_path))
-            payload = [result.json if hasattr(result, "json") else str(result) for result in results]
-            reply({"ok": True, "result": payload, "page_metadata": _page_metadata(input_path, payload)})
+            if os.path.splitext(input_path)[1].lower() == ".pdf":
+                pdf_source = input_path
+                input_path, raster_directory, page_metadata = _render_pdf_pages(pdf_source)
+                if temporary:
+                    os.unlink(temporary)
+                temporary = raster_directory
+                payload = []
+                for index, metadata in enumerate(page_metadata):
+                    result = list(pipeline.predict(input=os.path.join(input_path, f"page-{index + 1:04d}.png")))
+                    item = result[0].json if result and hasattr(result[0], "json") else (result[0] if result else {})
+                    if isinstance(item, dict):
+                        item = {**item, "page_index": index}
+                    payload.append(item)
+            else:
+                results = list(pipeline.predict(input=input_path))
+                payload = [result.json if hasattr(result, "json") else str(result) for result in results]
+                page_metadata = _page_metadata(input_path, payload)
+            reply({"ok": True, "result": payload, "page_metadata": page_metadata})
         except Exception as exc:
             reply({"ok": False, "error": str(exc)[:500]})
         finally:
-            if temporary:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
+            _cleanup_temporary(temporary)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,56 @@
+{
+  "dataset_version": "synthetic_pdf_forensics_v1",
+  "fixtures": [
+    {
+      "id": "clean",
+      "sha256": "24590c28edf71f19f4e65cf309d132c9ad58dbca0b3bfc775d55061fc3a761be",
+      "manipulated": false,
+      "expected": {
+        "incremental_update": false,
+        "signature_validity": "not_applicable"
+      }
+    },
+    {
+      "id": "benign_incremental_metadata",
+      "sha256": "6b0d873e80edf9ad0f8344d8ad699bc7df6354631c68e89d87ba037e6776d540",
+      "manipulated": false,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "not_applicable"
+      }
+    },
+    {
+      "id": "known_text_replacement",
+      "sha256": "a04d6d7edcc7b86862dad7300e246db45ab3c0c8ab69fa3fca30ae5e39550d46",
+      "manipulated": true,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "not_applicable",
+        "known_manipulated_region_pdf_points": {
+          "x0": 68,
+          "y0": 54,
+          "x1": 274,
+          "y1": 81
+        }
+      }
+    },
+    {
+      "id": "signed_original",
+      "sha256": "116a4deb0a70ddc05f68b06a9953f2c32bfed00322d89d3a923b2fa2cd5c34be",
+      "manipulated": false,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "valid"
+      }
+    },
+    {
+      "id": "signed_byte_range_mutation",
+      "sha256": "24835edc052b21106d19ab209de7a770929999896dc7d1d3c607d32a74dd34bf",
+      "manipulated": true,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "invalid"
+      }
+    }
+  ]
+}

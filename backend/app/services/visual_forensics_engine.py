@@ -220,7 +220,7 @@ def _safe_regions(value) -> list[dict]:
 
 def configured_engine() -> VisualForensicsEngine | None:
     """Return the configured engine, or None when the feature flag is off."""
-    if not settings.visual_forensics_enabled:
+    if not settings.visual_forensics_enabled or not settings.trufor_license_cleared:
         return None
     return TruForEngine(
         worker_url=settings.trufor_worker_url,
@@ -239,6 +239,16 @@ def engine_health_payload() -> dict:
             "feature_enabled": False,
             "available": False,
             "reason": "Visual forensics engine is disabled (VISUAL_FORENSICS_ENABLED=false). Existing deterministic checks are unaffected.",
+            "model_version": settings.trufor_model_version or None,
+            "checkpoint_sha256": settings.trufor_checkpoint_sha256 or None,
+            "device": settings.trufor_device,
+        }
+    if not settings.trufor_license_cleared:
+        return {
+            "engine": "trufor",
+            "feature_enabled": False,
+            "available": False,
+            "reason": "TruFor inference is blocked until intended use and applicable model/checkpoint terms are cleared (TRUFOR_LICENSE_CLEARED=false).",
             "model_version": settings.trufor_model_version or None,
             "checkpoint_sha256": settings.trufor_checkpoint_sha256 or None,
             "device": settings.trufor_device,

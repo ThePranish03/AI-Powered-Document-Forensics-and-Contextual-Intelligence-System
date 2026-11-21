@@ -91,6 +91,9 @@ class Document(Base):
     storage_key: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True, default=lambda: uuid.uuid4().hex)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    processing_error_retryable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    relationship_extraction_attempts: Mapped[int] = mapped_column(Integer, default=0)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processing_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -154,6 +157,9 @@ class EvidenceSpan(Base):
     text: Mapped[str] = mapped_column(Text)
     bounding_box: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
+    extraction_method: Mapped[str] = mapped_column(String(32), default="ocr")
+    coordinate_space: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_reference: Mapped[str] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -303,6 +309,41 @@ class VisualCandidateRegion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class PdfForensicRun(Base):
+    """Immutable structural-analysis snapshot bound to the original evidence hash."""
+    __tablename__ = "pdf_forensic_runs"
+    __table_args__ = (Index("ix_pdf_forensic_runs_document_created", "document_id", "created_at"),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(24))
+    parser_name: Mapped[str] = mapped_column(String(64))
+    parser_version: Mapped[str] = mapped_column(String(32))
+    result: Mapped[dict] = mapped_column(JSON)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PdfForensicArtifact(Base):
+    """Private, independently hashed object extracted from a PDF source."""
+    __tablename__ = "pdf_forensic_artifacts"
+    __table_args__ = (Index("ix_pdf_forensic_artifacts_run_object", "run_id", "object_number"),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("pdf_forensic_runs.id", ondelete="CASCADE"), index=True)
+    object_number: Mapped[int] = mapped_column(Integer)
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    storage_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    mime_type: Mapped[str] = mapped_column(String(64))
+    byte_size: Mapped[int] = mapped_column(Integer)
+    width_px: Mapped[int] = mapped_column(Integer)
+    height_px: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TimelineEvent(Base):
     __tablename__ = "timeline_events"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -334,6 +375,61 @@ class DerivedGraphNode(Base):
     reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DeterministicEvidenceMention(Base):
+    """One source occurrence of a typed deterministic identifier."""
+    __tablename__ = "deterministic_evidence_mentions"
+    __table_args__ = (
+        Index("ix_det_mentions_investigation_key", "investigation_id", "evidence_type", "normalized_value"),
+        Index("ix_det_mentions_document", "document_id", "source_sha256"),
+        Index("uq_det_mentions_source_occurrence", "document_id", "source_sha256", "block_id", "evidence_type", "normalized_value", "start_offset", "end_offset", "matcher_version", unique=True),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"))
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    filename: Mapped[str] = mapped_column(String(255))
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    evidence_type: Mapped[str] = mapped_column(String(48))
+    original_text: Mapped[str] = mapped_column(Text)
+    normalized_value: Mapped[str] = mapped_column(String(512))
+    block_id: Mapped[str] = mapped_column(String(100))
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    extraction_method: Mapped[str] = mapped_column(String(32))
+    label_context: Mapped[str] = mapped_column(String(120))
+    start_offset: Mapped[int] = mapped_column(Integer)
+    end_offset: Mapped[int] = mapped_column(Integer)
+    coordinates: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    strength: Mapped[str] = mapped_column(String(24))
+    matcher_version: Mapped[str] = mapped_column(String(48))
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RelationshipCandidate(Base):
+    """Stable investigation-scoped candidate with independent review state."""
+    __tablename__ = "relationship_candidates"
+    __table_args__ = (
+        Index("uq_relationship_candidates_key", "investigation_id", "candidate_key", unique=True),
+        Index("ix_relationship_candidates_lifecycle", "investigation_id", "lifecycle_status"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"))
+    candidate_key: Mapped[str] = mapped_column(String(64))
+    evidence_type: Mapped[str] = mapped_column(String(48))
+    normalized_value: Mapped[str] = mapped_column(String(512))
+    lifecycle_status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
+    review_status: Mapped[str] = mapped_column(String(16), default="pending", server_default="pending")
+    evidence_refs: Mapped[list] = mapped_column(JSON, default=list)
+    document_ids: Mapped[list] = mapped_column(JSON, default=list)
+    explanation: Mapped[str] = mapped_column(Text)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_history: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class DossierSnapshot(Base):

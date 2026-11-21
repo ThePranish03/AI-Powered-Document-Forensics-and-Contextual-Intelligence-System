@@ -1,0 +1,130 @@
+{
+  "dataset_version": "synthetic_pdf_forensics_v1",
+  "generated_at": "2026-11-20T08:01:44.974931+00:00",
+  "fixture_count": 5,
+  "fixtures": [
+    {
+      "id": "clean",
+      "sha256": "24590c28edf71f19f4e65cf309d132c9ad58dbca0b3bfc775d55061fc3a761be",
+      "manipulated": false,
+      "expected": {
+        "incremental_update": false,
+        "signature_validity": "not_applicable"
+      },
+      "observed": {
+        "revision_inventory_status": "completed",
+        "revision_count": 1,
+        "incremental_change": false,
+        "signature_cryptographic_integrity": []
+      },
+      "revision_change_heuristic_prediction": false,
+      "signature_validity_prediction": "not_applicable"
+    },
+    {
+      "id": "benign_incremental_metadata",
+      "sha256": "6b0d873e80edf9ad0f8344d8ad699bc7df6354631c68e89d87ba037e6776d540",
+      "manipulated": false,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "not_applicable"
+      },
+      "observed": {
+        "revision_inventory_status": "completed",
+        "revision_count": 2,
+        "incremental_change": true,
+        "signature_cryptographic_integrity": []
+      },
+      "revision_change_heuristic_prediction": true,
+      "signature_validity_prediction": "not_applicable"
+    },
+    {
+      "id": "known_text_replacement",
+      "sha256": "a04d6d7edcc7b86862dad7300e246db45ab3c0c8ab69fa3fca30ae5e39550d46",
+      "manipulated": true,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "not_applicable",
+        "known_manipulated_region_pdf_points": {
+          "x0": 68,
+          "y0": 54,
+          "x1": 274,
+          "y1": 81
+        }
+      },
+      "observed": {
+        "revision_inventory_status": "completed",
+        "revision_count": 2,
+        "incremental_change": true,
+        "signature_cryptographic_integrity": []
+      },
+      "revision_change_heuristic_prediction": true,
+      "signature_validity_prediction": "not_applicable"
+    },
+    {
+      "id": "signed_original",
+      "sha256": "116a4deb0a70ddc05f68b06a9953f2c32bfed00322d89d3a923b2fa2cd5c34be",
+      "manipulated": false,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "valid"
+      },
+      "observed": {
+        "revision_inventory_status": "completed",
+        "revision_count": 2,
+        "incremental_change": true,
+        "signature_cryptographic_integrity": [
+          "valid"
+        ]
+      },
+      "revision_change_heuristic_prediction": true,
+      "signature_validity_prediction": "valid"
+    },
+    {
+      "id": "signed_byte_range_mutation",
+      "sha256": "24835edc052b21106d19ab209de7a770929999896dc7d1d3c607d32a74dd34bf",
+      "manipulated": true,
+      "expected": {
+        "incremental_update": true,
+        "signature_validity": "invalid"
+      },
+      "observed": {
+        "revision_inventory_status": "completed",
+        "revision_count": 2,
+        "incremental_change": true,
+        "signature_cryptographic_integrity": [
+          "invalid"
+        ]
+      },
+      "revision_change_heuristic_prediction": true,
+      "signature_validity_prediction": "invalid"
+    }
+  ],
+  "metrics": {
+    "any_incremental_object_change_as_manipulation": {
+      "n": 5,
+      "tp": 2,
+      "fp": 2,
+      "fn": 0,
+      "tn": 1,
+      "precision": 0.5,
+      "recall": 1.0,
+      "false_positive_rate": 0.6666666666666666
+    },
+    "pyhanko_signature_integrity_invalidity_on_signed_subset": {
+      "n": 2,
+      "tp": 1,
+      "fp": 0,
+      "fn": 0,
+      "tn": 1,
+      "precision": 1.0,
+      "recall": 1.0,
+      "false_positive_rate": 0.0
+    }
+  },
+  "limitations": [
+    "Synthetic controlled fixtures only; sample size is too small for general accuracy claims.",
+    "Revision changes are evaluated as a deliberately naive manipulation heuristic to measure its false positives; they are not classified as fraud by the application.",
+    "Signature test uses a self-signed synthetic certificate and measures cryptographic integrity only, not real-world trust or identity.",
+    "OCR and visual inference performance are not benchmarked because this script does not run an OCR engine or a cleared TruFor model."
+  ]
+}

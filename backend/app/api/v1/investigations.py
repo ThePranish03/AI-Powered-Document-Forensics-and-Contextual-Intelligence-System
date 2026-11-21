@@ -15,8 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, require_csrf, require_permission
 from app.core.config import settings
-from app.models.entities import ActivityEvent, DerivedGraphNode, Document, EvidencePage, EvidenceSpan, ExtractionRun, Finding, Investigation, InvestigationStatus, OCRResult, RelationshipAnalysis, TimelineEvent, User
+from app.models.entities import ActivityEvent, DerivedGraphNode, Document, EvidencePage, EvidenceSpan, ExtractionRun, Finding, Investigation, InvestigationStatus, OCRResult, RelationshipAnalysis, RelationshipCandidate, TimelineEvent, User
 from app.services.audit_chain import append_audit
+from app.services.relationship_index import _candidate_key
+from app.services.relationship_review import consistent_legacy_review_field, project_candidate_review, resolve_legacy_candidate_review, review_history_status
 from app.schemas.investigation import DocumentResponse, InvestigationCreate, InvestigationPatch
 
 router = APIRouter()
@@ -40,6 +42,25 @@ def stored_document_path(doc: Document, *, require_exists: bool = True) -> Path:
     if path.parent != root or path.is_symlink() or (require_exists and not path.is_file()):
         raise HTTPException(status_code=404, detail="Stored document is unavailable")
     return path
+
+
+def _document_analysis_stages(document: Document, payload: object) -> dict[str, str]:
+    record = payload if isinstance(payload, dict) else {}
+    stored = record.get("analysis_stages") if isinstance(record.get("analysis_stages"), dict) else {}
+    deterministic = record.get("deterministic_analysis") if isinstance(record.get("deterministic_analysis"), dict) else {}
+    terminal = document.processing_status
+    deterministic_status = stored.get("deterministic_evidence") or deterministic.get("status")
+    correlation_status = stored.get("investigation_correlation") or deterministic.get("correlation_status")
+    ai_status = stored.get("ai_enrichment")
+    if ai_status is None:
+        ai_status = "completed" if terminal == "relationship_extraction_completed" else "failed" if terminal == "relationship_extraction_failed" else "pending"
+    return {
+        "source_extraction": stored.get("source_extraction", "completed" if terminal not in {"queued", "processing", "failed"} else "pending"),
+        "deterministic_evidence": deterministic_status or "pending",
+        "investigation_correlation": correlation_status or "pending",
+        "ai_enrichment": ai_status,
+        "investigator_review": stored.get("investigator_review", "pending"),
+    }
 
 
 async def owned_investigation(db: AsyncSession, user: User, investigation_id: UUID) -> Investigation:
@@ -157,15 +178,26 @@ async def update_investigation(investigation_id: UUID, payload: InvestigationPat
 @router.get("/{investigation_id}/documents", response_model=list[DocumentResponse])
 async def list_documents(investigation_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
     await owned_investigation(db, user, investigation_id)
-    documents = (await db.scalars(select(Document).where(Document.investigation_id == investigation_id).order_by(Document.created_at.desc()))).all()
+    rows = (await db.execute(
+        select(Document, RelationshipAnalysis)
+        .outerjoin(RelationshipAnalysis, RelationshipAnalysis.document_id == Document.id)
+        .where(Document.investigation_id == investigation_id)
+        .order_by(Document.created_at.desc())
+    )).all()
     return [{
         "id": str(doc.id), "filename": doc.filename, "content_type": doc.content_type,
         "source_description": doc.source_description,
         "uploaded_by_user_id": str(doc.uploaded_by_user_id) if doc.uploaded_by_user_id else None,
         "size_bytes": doc.size_bytes, "processing_status": doc.processing_status,
-        "attempts_remaining": max(0, 3 - doc.processing_attempts), "created_at": doc.created_at,
+        "attempts_remaining": max(0, 3 - (doc.relationship_extraction_attempts if doc.processing_status == "relationship_extraction_failed" else doc.processing_attempts)),
+        "processing_error": doc.processing_error,
+        "processing_error_code": doc.processing_error_code,
+        "processing_error_retryable": doc.processing_error_retryable,
+        "analysis_stages": _document_analysis_stages(doc, relationship.payload if relationship else None),
+        "relationship_extraction_attempts": doc.relationship_extraction_attempts,
+        "created_at": doc.created_at,
         "sha256": doc.sha256,
-    } for doc in documents]
+    } for doc, relationship in rows]
 
 
 @router.post("/{investigation_id}/documents", status_code=201)
@@ -236,8 +268,16 @@ async def document_status(investigation_id: UUID, document_id: UUID, db: AsyncSe
     doc = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
+    relationship = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc.id))
     failed = doc.processing_status in {"failed", "relationship_extraction_failed"}
-    return {"id": str(doc.id), "status": doc.processing_status, "error": doc.processing_error if failed else None}
+    return {
+        "id": str(doc.id), "status": doc.processing_status,
+        "error": doc.processing_error if failed else None,
+        "error_code": doc.processing_error_code if failed else None,
+        "retryable": doc.processing_error_retryable if failed else None,
+        "analysis_stages": _document_analysis_stages(doc, relationship.payload if relationship else None),
+        "attempts_remaining": max(0, 3 - (doc.relationship_extraction_attempts if doc.processing_status == "relationship_extraction_failed" else doc.processing_attempts)),
+    }
 
 
 @router.get("/{investigation_id}/documents/{document_id}")
@@ -249,6 +289,7 @@ async def document_details(investigation_id: UUID, document_id: UUID, db: AsyncS
     latest_run = await db.scalar(
         select(ExtractionRun).where(ExtractionRun.document_id == doc.id).order_by(ExtractionRun.run_number.desc()).limit(1)
     )
+    relationship = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc.id))
     return {
         "id": str(doc.id),
         "investigation_id": str(doc.investigation_id),
@@ -259,8 +300,12 @@ async def document_details(investigation_id: UUID, document_id: UUID, db: AsyncS
         "size_bytes": doc.size_bytes,
         "sha256": doc.sha256,
         "processing_status": doc.processing_status,
+        "analysis_stages": _document_analysis_stages(doc, relationship.payload if relationship else None),
         "processing_error": doc.processing_error,
+        "processing_error_code": doc.processing_error_code,
+        "processing_error_retryable": doc.processing_error_retryable,
         "processing_attempts": doc.processing_attempts,
+        "relationship_extraction_attempts": doc.relationship_extraction_attempts,
         "created_at": doc.created_at.isoformat(),
         "processing_started_at": doc.processing_started_at.isoformat() if doc.processing_started_at else None,
         "processing_completed_at": doc.processing_completed_at.isoformat() if doc.processing_completed_at else None,
@@ -384,6 +429,9 @@ async def get_extraction_run(investigation_id: UUID, document_id: UUID, run_id: 
             "text": span.text,
             "bounding_box": span.bounding_box,
             "confidence": span.confidence,
+            "extraction_method": span.extraction_method,
+            "coordinate_space": span.coordinate_space,
+            "source_sha256": span.source_sha256,
             "source_reference": span.source_reference,
         } for span in spans],
     }
@@ -398,8 +446,10 @@ async def document_ocr(investigation_id: UUID, document_id: UUID, include_raw: b
     result = await db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
     if result is None:
         raise HTTPException(status_code=409, detail="OCR output is not available yet")
+    raw_result = result.raw_result if isinstance(result.raw_result, dict) else {}
     data = {"document_id": str(document_id), "provider": result.provider, "provider_version": result.provider_version,
-            "recognized_text": result.recognized_text, "blocks": result.blocks}
+            "recognized_text": result.recognized_text, "blocks": result.blocks,
+            "extraction_coverage": raw_result.get("extraction_coverage", {"status": "unavailable", "reason": "No page-level coverage data was recorded for this extraction run."})}
     if include_raw:
         data["raw_result"] = result.raw_result
     return data
@@ -412,14 +462,23 @@ async def retry_document(investigation_id: UUID, document_id: UUID, request: Req
     doc = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    if doc.processing_status not in {"failed", "relationship_extraction_failed"} or doc.processing_attempts >= 3:
+    if doc.processing_status not in {"failed", "relationship_extraction_failed"}:
         raise HTTPException(status_code=409, detail="This document cannot be retried")
-    doc.processing_status = "queued"
+    relation_only = doc.processing_status == "relationship_extraction_failed"
+    attempts = doc.relationship_extraction_attempts if relation_only else doc.processing_attempts
+    if attempts >= 3 or doc.processing_error_retryable is False:
+        raise HTTPException(status_code=409, detail="This document cannot be retried")
+    has_ocr = await db.scalar(select(OCRResult.id).where(OCRResult.document_id == doc.id)) is not None
+    if relation_only and not has_ocr:
+        raise HTTPException(status_code=409, detail="Stored OCR evidence is unavailable; relationship-only retry is not possible")
+    doc.processing_status = "relationship_extraction_pending" if relation_only else "queued"
     doc.processing_error = None
+    doc.processing_error_code = None
+    doc.processing_error_retryable = None
     doc.processing_started_at = None
     doc.processing_completed_at = None
     await db.commit()
-    return {"id": str(document_id), "status": "queued", "attempts_remaining": 3 - doc.processing_attempts}
+    return {"id": str(document_id), "status": doc.processing_status, "attempts_remaining": max(0, 3 - attempts)}
 
 
 @router.get("/{investigation_id}/relationships/graph")
@@ -532,7 +591,50 @@ async def relationship_graph(investigation_id: UUID, db: AsyncSession = Depends(
             edges.append(edge)
             graph_edges.append(edge)
     derived = (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation_id))).all()
+    indexed_candidates = (await db.scalars(select(RelationshipCandidate).where(
+        RelationshipCandidate.investigation_id == investigation_id,
+    ))).all()
+    candidates_by_key = {item.candidate_key: item for item in indexed_candidates}
+    legacy_groups = {}
     for item in derived:
+        key = _candidate_key(investigation_id, item.entity_type, item.label)
+        legacy_groups.setdefault(key, []).append(item)
+    legacy_resolutions = {}
+    for key, group in legacy_groups.items():
+        candidate = candidates_by_key.get(key)
+        source_document_ids = (
+            candidate.document_ids if candidate is not None
+            else sorted({str(value) for item in group for value in (item.document_ids or [])})
+        )
+        legacy_resolutions[key] = resolve_legacy_candidate_review(
+            investigation_id=investigation_id,
+            evidence_type=group[0].entity_type,
+            normalized_value=group[0].label,
+            candidate_document_ids=source_document_ids,
+            legacy_nodes=group,
+        )
+    for item in derived:
+        candidate_key = _candidate_key(investigation_id, item.entity_type, item.label)
+        candidate = candidates_by_key.get(candidate_key)
+        mapping = legacy_resolutions[candidate_key]
+        indexed_review_status = candidate.review_status if candidate is not None else None
+        projected_review = project_candidate_review(indexed_review_status, mapping)
+        projected_status = projected_review["review_status"]
+        reviewed_at = (
+            candidate.reviewed_at if indexed_review_status not in {None, "pending"}
+            else consistent_legacy_review_field(mapping, "reviewed_at") if mapping["status"] == "matched"
+            else None
+        )
+        reviewed_by = (
+            candidate.reviewed_by_user_id if indexed_review_status not in {None, "pending"}
+            else consistent_legacy_review_field(mapping, "reviewed_by_user_id") if mapping["status"] == "matched"
+            else None
+        )
+        review_reason = (
+            candidate.review_reason if indexed_review_status not in {None, "pending"}
+            else consistent_legacy_review_field(mapping, "review_reason") if mapping["status"] == "matched"
+            else None
+        )
         node = nodes.setdefault(item.canonical_id, {
             "id": item.canonical_id, "label": item.label, "type": item.entity_type,
             "document_ids": [], "resolution": item.resolution, "basis": item.basis,
@@ -548,20 +650,35 @@ async def relationship_graph(investigation_id: UUID, db: AsyncSession = Depends(
             "kind": "entity",
             "label": item.label,
             "type": item.entity_type,
-            "status": item.review_status,
+            "status": projected_status,
             "confidence": None,
             "document_ids": [],
             "resolution": item.resolution,
             "metadata": {
                 "basis": item.basis,
-                "review_status": item.review_status,
-                "review_reason": item.review_reason,
-                "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else None,
+                "review_status": projected_status,
+                "review_reason": review_reason,
+                "reviewed_at": reviewed_at.isoformat() if reviewed_at else None,
+                "reviewed_by_user_id": str(reviewed_by) if reviewed_by else None,
+                "review_mapping": mapping,
+                "indexed_review_status": indexed_review_status,
+                "review_history": candidate.review_history if candidate is not None else [],
+                "review_history_status": review_history_status(candidate.review_history if candidate is not None else None, mapping),
             },
         })
-        graph_nodes[item.canonical_id]["status"] = item.review_status
+        graph_nodes[item.canonical_id]["status"] = projected_status
         graph_nodes[item.canonical_id]["document_ids"] = node["document_ids"]
         graph_nodes[item.canonical_id]["metadata"]["basis"] = item.basis
+        graph_nodes[item.canonical_id]["metadata"].update({
+            "review_status": projected_status,
+            "review_reason": review_reason,
+            "reviewed_at": reviewed_at.isoformat() if reviewed_at else None,
+            "reviewed_by_user_id": str(reviewed_by) if reviewed_by else None,
+            "review_mapping": mapping,
+            "indexed_review_status": indexed_review_status,
+            "review_history": candidate.review_history if candidate is not None else [],
+            "review_history_status": review_history_status(candidate.review_history if candidate is not None else None, mapping),
+        })
         for document_id in item.document_ids:
             document = document_by_id.get(document_id)
             if document is None:

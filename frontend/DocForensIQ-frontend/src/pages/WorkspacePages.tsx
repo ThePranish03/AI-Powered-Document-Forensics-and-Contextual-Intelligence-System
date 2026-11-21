@@ -158,7 +158,7 @@ function QueryError({ onRetry }: { onRetry: () => void }) {
 function StatusBadge({ value }: { value: string }) {
   const color = ['completed', 'ocr_completed', 'relationship_extraction_completed'].includes(value) ? 'green'
     : ['failed', 'relationship_extraction_failed'].includes(value) ? 'red'
-      : ['processing', 'relationship_extraction_pending'].includes(value) ? 'amber'
+      : ['processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(value) ? 'amber'
         : value === 'queued' ? 'blue'
           : value === 'in_review' ? 'amber' : value === 'archived' ? 'neutral' : 'blue';
   const labels: Record<string, string> = {
@@ -166,6 +166,7 @@ function StatusBadge({ value }: { value: string }) {
     processing: 'OCR in progress',
     ocr_completed: 'OCR complete',
     relationship_extraction_pending: 'Finding relationships',
+    relationship_extraction_processing: 'Finding relationships',
     relationship_extraction_completed: 'Analysis complete',
     relationship_extraction_failed: 'Relationship analysis failed',
     completed: 'Complete',
@@ -249,7 +250,7 @@ export function DashboardPage() {
         <RecentActivityPanel items={activity.data ?? []}/>
       </div>}
     </>}
-    <div className="dashboard-boundary"><ShieldCheck size={14}/><span>Document OCR is available for configured image uploads. Relationship extraction requires the OCR worker and a backend xAI key.</span></div>
+    <div className="dashboard-boundary"><ShieldCheck size={14}/><span>Document OCR is available for configured image uploads. Relationship extraction requires the OCR worker and a backend Groq API key.</span></div>
   </section>;
 }
 
@@ -309,7 +310,7 @@ export function NewInvestigationPage() {
   </section>;
 }
 
-type DocumentItem = RelationshipDocument & { attempts_remaining: number; source_description?: string | null; uploaded_by_user_id?: string | null };
+type DocumentItem = RelationshipDocument & { attempts_remaining: number; processing_error?: string | null; processing_error_code?: string | null; processing_error_retryable?: boolean | null; relationship_extraction_attempts?: number; analysis_stages?: Record<string, string>; source_description?: string | null; uploaded_by_user_id?: string | null };
 type GraphResponse = {
   nodes: RelationshipEntity[];
   edges: RelationshipClaim[];
@@ -317,9 +318,9 @@ type GraphResponse = {
   graph_edges?: ApiGraphEdge[];
   meta: { investigation_id: string; graph_version: string };
 };
-type OCRResponse = { document_id: string; provider: string; provider_version: string | null; recognized_text: string; blocks: { block_id: string; source_path: string; text: string; page_index?: number; engine_bbox?: unknown; engine_confidence?: number }[]; raw_result?: unknown };
+type OCRResponse = { document_id: string; provider: string; provider_version: string | null; recognized_text: string; extraction_coverage?: { page_count?: number; ocr_blocks?: number; native_pdf_blocks?: number; pages_with_native_text?: number; pages_with_ocr_text?: number; status?: string; reason?: string }; blocks: { block_id: string; source_path: string; text: string; page_index?: number; engine_bbox?: unknown; engine_confidence?: number | null; extraction_method?: string; bbox_space?: string; table_structure_status?: string; cells?: Array<{ header?: string | null; raw_text: string; column_index: number; bbox?: unknown }> }[]; raw_result?: unknown };
 type ExtractionRun = { id: string; run_number: number; provider: string; provider_version: string | null; configuration: Record<string, unknown>; status: string; error_detail: string | null; latency_ms: number | null; started_at: string | null; completed_at: string | null };
-type ExtractionDetail = ExtractionRun & { pages: Array<{ id: string; page_number: number; width: number | null; height: number | null; text: string }>; spans: Array<{ id: string; page_id: string | null; block_id: string; text: string; bounding_box: unknown; confidence: number | null; source_reference: string }> };
+type ExtractionDetail = ExtractionRun & { pages: Array<{ id: string; page_number: number; width: number | null; height: number | null; text: string }>; spans: Array<{ id: string; page_id: string | null; block_id: string; text: string; bounding_box: unknown; confidence: number | null; extraction_method: string; coordinate_space: string | null; source_sha256: string | null; source_reference: string }> };
 
 function boundingRect(value: unknown): { left: number; top: number; width: number; height: number } | null {
   if (!Array.isArray(value)) return null;
@@ -402,17 +403,17 @@ export function InvestigationUnavailable() {
     queryFn: () => apiRequest<DocumentItem[]>(`/investigations/${investigationId}/documents`),
     enabled: Boolean(investigationId),
     refetchInterval: (query) => Array.isArray(query.state.data) && query.state.data.some((doc) =>
-      ['queued', 'processing', 'relationship_extraction_pending'].includes(doc.processing_status)) ? 2500 : false,
+      ['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(doc.processing_status)) ? 2500 : false,
   });
   const documentItems = useMemo(() => Array.isArray(documents.data) ? documents.data : [], [documents.data]);
   const filteredDocuments = useMemo(() => documentItems.filter((doc) =>
     (!documentStatusFilter || doc.processing_status === documentStatusFilter)
     && (!documentSearch.trim() || `${doc.filename} ${doc.sha256 ?? ''} ${doc.source_description ?? ''}`.toLocaleLowerCase().includes(documentSearch.trim().toLocaleLowerCase())),
   ), [documentItems, documentSearch, documentStatusFilter]);
-  const inProgressCount = documentItems.filter((doc) => ['queued', 'processing', 'relationship_extraction_pending'].includes(doc.processing_status)).length;
+  const inProgressCount = documentItems.filter((doc) => ['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(doc.processing_status)).length;
   const waitingCount = documentItems.filter((doc) => doc.processing_status === 'queued').length;
   const selectedDocument = documentItems.find((doc) => doc.id === selectedDocumentId);
-  const ocrReady = selectedDocument && ['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed'].includes(selectedDocument.processing_status);
+  const ocrReady = selectedDocument && ['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_processing', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed'].includes(selectedDocument.processing_status);
   const ocr = useQuery({
     queryKey: ['ocr', investigationId, selectedDocumentId, includeRaw],
     queryFn: () => apiRequest<OCRResponse>(`/investigations/${investigationId}/documents/${selectedDocumentId}/ocr${includeRaw ? '?include_raw=true' : ''}`),
@@ -466,14 +467,14 @@ export function InvestigationUnavailable() {
   );
   const documentStatus = useQuery({
     queryKey: ['document-status', investigationId, selectedDocumentId],
-    queryFn: () => apiRequest<{ id: string; status: string; error: string | null }>(`/investigations/${investigationId}/documents/${selectedDocumentId}/status`),
+    queryFn: () => apiRequest<{ id: string; status: string; error: string | null; error_code: string | null; retryable: boolean | null; attempts_remaining: number }>(`/investigations/${investigationId}/documents/${selectedDocumentId}/status`),
     enabled: Boolean(selectedDocumentId && ['failed', 'relationship_extraction_failed'].includes(selectedDocument?.processing_status ?? '') && !relationshipsPage),
   });
   const graph = useQuery({
     queryKey: ['relationships', investigationId],
     queryFn: () => apiRequest<GraphResponse>(`/investigations/${investigationId}/relationships/graph`),
     enabled: relationshipsPage,
-    refetchInterval: () => documentItems.some((doc) => ['queued', 'processing', 'relationship_extraction_pending'].includes(doc.processing_status)) ? 2500 : false,
+    refetchInterval: () => documentItems.some((doc) => ['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(doc.processing_status)) ? 2500 : false,
   });
   async function uploadFiles(files: File[], form: HTMLFormElement) {
     if (!files.length) return;
@@ -531,6 +532,10 @@ export function InvestigationUnavailable() {
 
   async function retryDocument(documentId: string) {
     setError('');
+    if (documentItems.find((item) => item.id === documentId)?.processing_error_retryable === false) {
+      setError('This processing error is not retryable. Resolve its reported cause before retrying.');
+      return;
+    }
     try {
       await apiRequest(`/investigations/${investigationId}/documents/${documentId}/retry`, { method: 'POST' });
       await Promise.all([
@@ -636,11 +641,12 @@ export function InvestigationUnavailable() {
         {overlayPage && <p className="muted">Region overlays use original-image coordinates from OCR · Page dimensions {overlayPage.width} × {overlayPage.height}.</p>}
       </div>}
       {selectedDocument.sha256 && <p className="muted">Original SHA-256: <code>{selectedDocument.sha256}</code> · uploaded {fmtDate(selectedDocument.created_at)} · {selectedDocument.source_description || 'source not described'}</p>}
+      {selectedDocument.analysis_stages && <p className="muted" aria-label="Document analysis stages">Source extraction: {selectedDocument.analysis_stages.source_extraction || 'pending'} · Deterministic evidence: {selectedDocument.analysis_stages.deterministic_evidence || 'pending'} · Investigation correlation: {selectedDocument.analysis_stages.investigation_correlation || 'pending'} · AI enrichment: {selectedDocument.analysis_stages.ai_enrichment || 'pending'} · Investigator review: {selectedDocument.analysis_stages.investigator_review || 'pending'}</p>}
       {showRunHistory && <section className="panel" aria-label="OCR extraction history"><div className="panel-head"><div><h3>Versioned OCR extraction runs</h3><p>Each run retains its engine output and page/span references; older results are not overwritten.</p></div></div>{extractionRuns.isLoading ? <p role="status">Loading extraction runs…</p> : extractionRuns.isError ? <p role="alert">Extraction history could not be loaded.</p> : (extractionRuns.data?.items.length ?? 0) === 0 ? <p>No versioned extraction runs are available for this document yet.</p> : <><label className="auth-label">Compare with run<select aria-label="Select OCR run to inspect" value={selectedRunId || extractionRuns.data?.items[0]?.id || ''} onChange={(event) => setSelectedRunId(event.target.value)}>{extractionRuns.data?.items.map((run) => <option key={run.id} value={run.id}>Run {run.run_number} · {run.provider} {run.provider_version || ''} · {run.status}</option>)}</select></label><ul className="extraction-run-list">{extractionRuns.data?.items.map((run) => <li key={run.id}>Run {run.run_number} · {run.status} · {run.latency_ms == null ? 'duration unavailable' : `${run.latency_ms.toFixed(0)} ms`}{run.error_detail ? ` · ${run.error_detail}` : ''}</li>)}</ul>{extractionDetail.data && <div className="extraction-page-list"><h4>Run {extractionDetail.data.run_number} normalized pages and regions</h4>{extractionDetail.data.pages.map((page) => <article key={page.id}><b>Page {page.page_number}</b><small>{page.width && page.height ? `${page.width} × ${page.height}` : 'Page dimensions unavailable'}</small><pre>{page.text}</pre></article>)}</div>}</>}</section>}
-      {['queued', 'processing', 'relationship_extraction_pending'].includes(selectedDocument.processing_status) && <p className="processing-help" role="status" aria-live="polite">{selectedDocument.processing_status === 'queued' ? 'Your upload is safe. The OCR worker will pick it up automatically as soon as it finishes the document ahead of it.' : selectedDocument.processing_status === 'processing' ? 'PaddleOCR is reading your image now. On the first run, OCR may take a few minutes while its models initialize.' : 'OCR is complete. Relationship analysis is now running automatically.'}</p>}
-      {['failed', 'relationship_extraction_failed'].includes(selectedDocument.processing_status) && <p className="auth-error" role="alert">{documentStatus.data?.error ?? 'Processing failed. You can retry this document.'}</p>}
-      {ocrReady && (ocr.isLoading ? <LoadingPanel/> : ocr.isError ? <QueryError onRetry={() => void ocr.refetch()}/> : <><div className="panel-head"><div><h3>Recognized text</h3><p>{ocr.data?.provider} {ocr.data?.provider_version ? `v${ocr.data.provider_version}` : ''} · {ocr.data?.blocks.length ?? 0} source blocks</p></div><button className="button secondary small" onClick={() => setIncludeRaw((value) => !value)}>{includeRaw ? 'Hide raw engine output' : 'Show raw engine output'}</button></div><pre className="ocr-text">{ocr.data?.recognized_text || 'No text was recognized.'}</pre><label className="auth-label">Search OCR regions<input value={regionSearch} onChange={(event) => setRegionSearch(event.target.value)} placeholder="Search text or block ID"/></label><div className="ocr-block-list">{displayedBlocks.map((block) => <button id={`ocr-block-${block.block_id}`} type="button" className={`ocr-region-card ${selectedBlockId === block.block_id ? 'is-selected' : ''}`} key={block.block_id} onClick={() => setSelectedBlockId(block.block_id)}><b>{block.block_id}</b><small>{block.page_index == null ? block.source_path : `Page ${block.page_index + 1} · ${block.source_path}`}</small><p>{block.text}</p>{block.engine_bbox != null && <small>Bounds: {JSON.stringify(block.engine_bbox)}{block.engine_confidence == null ? '' : ` · engine confidence ${block.engine_confidence} (not calibrated accuracy)`}</small>}</button>)}</div>{includeRaw && <pre className="ocr-text">{JSON.stringify(ocr.data?.raw_result, null, 2)}</pre>}</>)}
+      {['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(selectedDocument.processing_status) && <p className="processing-help" role="status" aria-live="polite">{selectedDocument.processing_status === 'queued' ? 'Your upload is safe. The OCR worker will pick it up automatically as soon as it finishes the document ahead of it.' : selectedDocument.processing_status === 'processing' ? 'PaddleOCR is reading your image now. On the first run, OCR may take a few minutes while its models initialize.' : 'OCR is complete. Relationship analysis is now running automatically.'}</p>}
+      {['failed', 'relationship_extraction_failed'].includes(selectedDocument.processing_status) && <p className={selectedDocument.analysis_stages?.deterministic_evidence === 'completed' ? 'processing-help' : 'auth-error'} role={selectedDocument.analysis_stages?.deterministic_evidence === 'completed' ? 'status' : 'alert'}>{selectedDocument.analysis_stages?.deterministic_evidence === 'completed' ? `AI enrichment ${selectedDocument.analysis_stages.ai_enrichment || 'failed'}; deterministic evidence and investigation correlation remain available.` : documentStatus.data?.error ?? selectedDocument.processing_error ?? 'Processing failed.'}{(documentStatus.data?.error_code ?? selectedDocument.processing_error_code) ? ` (${documentStatus.data?.error_code ?? selectedDocument.processing_error_code})` : ''}</p>}
+      {ocrReady && (ocr.isLoading ? <LoadingPanel/> : ocr.isError ? <QueryError onRetry={() => void ocr.refetch()}/> : <><div className="panel-head"><div><h3>Extracted source text</h3><p>{ocr.data?.provider} {ocr.data?.provider_version ? `v${ocr.data.provider_version}` : ''} · {ocr.data?.blocks.length ?? 0} source blocks · {ocr.data?.extraction_coverage?.page_count ?? '—'} page(s)</p></div><button className="button secondary small" onClick={() => setIncludeRaw((value) => !value)}>{includeRaw ? 'Hide raw extraction output' : 'Show raw extraction output'}</button></div><pre className="ocr-text">{ocr.data?.recognized_text || 'No text was extracted.'}</pre><label className="auth-label">Search source regions<input value={regionSearch} onChange={(event) => setRegionSearch(event.target.value)} placeholder="Search text or block ID"/></label><div className="ocr-block-list">{displayedBlocks.map((block) => <button id={`ocr-block-${block.block_id}`} type="button" className={`ocr-region-card ${selectedBlockId === block.block_id ? 'is-selected' : ''}`} key={block.block_id} onClick={() => setSelectedBlockId(block.block_id)}><b>{block.block_id}</b><small>{block.page_index == null ? block.source_path : `Page ${block.page_index + 1} · ${block.source_path}`}</small><small>Method: {block.extraction_method || 'ocr'}{block.table_structure_status ? ` · table structure ${block.table_structure_status}` : ''}{block.bbox_space ? ` · ${block.bbox_space}` : ''}</small><p>{block.text}</p>{block.cells?.length ? <small>Cells: {block.cells.map((cell) => `${cell.header || `Column ${cell.column_index + 1}`} = ${cell.raw_text}`).join(' · ')}</small> : null}{block.engine_bbox != null && <small>Bounds: {JSON.stringify(block.engine_bbox)}{block.engine_confidence == null ? '' : ` · engine confidence ${block.engine_confidence} (not calibrated accuracy)`}</small>}</button>)}</div>{ocr.data?.extraction_coverage && <p className="muted">Coverage: {ocr.data.extraction_coverage.pages_with_ocr_text ?? 0} page(s) with OCR text, {ocr.data.extraction_coverage.pages_with_native_text ?? 0} with native PDF text, and {ocr.data.extraction_coverage.native_pdf_blocks ?? 0} native table/text blocks.</p>}{includeRaw && <pre className="ocr-text">{JSON.stringify(ocr.data?.raw_result, null, 2)}</pre>}</>)}
     </section>}
-    <div className="dashboard-boundary"><ShieldCheck size={14}/><span>OCR output preserves the engine JSON and source block references. Relationship claims are descriptive and cite their source blocks.</span></div>
+    <div className="dashboard-boundary"><ShieldCheck size={14}/><span>Native PDF text and OCR remain separate source observations. Table cells retain row and column references when the PDF layout supports them; other layouts are marked uncertain.</span></div>
   </section>;
 }

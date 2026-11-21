@@ -12,7 +12,7 @@ interface VisualRun { id: string; document_id: string; status: string; created_a
 interface FindingEvidence { document_id?: string; filename?: string; page_number?: number | null; block_id?: string | null; quoted_text?: string; field_type?: string; bounding_box?: { x0?: number; y0?: number; x1?: number; y1?: number } | null; }
 interface InvestigationFinding { id: string; title: string; description: string; severity: string; status: string; evidence_refs: FindingEvidence[]; }
 
-const readyStatuses = new Set(['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed']);
+const readyStatuses = new Set(['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_processing', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed']);
 function bounds(value: unknown) {
   if (!Array.isArray(value)) return null;
   const points: number[][] | null = value.length === 4 && value.every((part) => typeof part === 'number')

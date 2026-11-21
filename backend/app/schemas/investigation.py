@@ -43,5 +43,10 @@ class DocumentResponse(BaseModel):
     size_bytes: int
     processing_status: str
     attempts_remaining: int = 3
+    processing_error: str | None = None
+    processing_error_code: str | None = None
+    processing_error_retryable: bool | None = None
+    analysis_stages: dict[str, str] = Field(default_factory=dict)
+    relationship_extraction_attempts: int = 0
     created_at: datetime
     sha256: str | None = None

@@ -39,6 +39,20 @@ def test_engine_health_payload_is_honest_when_feature_disabled():
     assert payload["model_version"] is None
 
 
+def test_engine_license_gate_blocks_configured_worker_by_default(monkeypatch):
+    monkeypatch.setattr(engine_module, "settings", replace(
+        settings,
+        visual_forensics_enabled=True,
+        trufor_license_cleared=False,
+        trufor_worker_url="http://worker.example",
+    ))
+    payload = engine_health_payload()
+    assert payload["feature_enabled"] is False
+    assert payload["available"] is False
+    assert "TRUFOR_LICENSE_CLEARED=false" in payload["reason"]
+    assert engine_module.configured_engine() is None
+
+
 def test_engine_region_sanitization_keeps_only_well_formed_worker_regions():
     from app.services.visual_forensics_engine import _safe_regions
 
@@ -99,7 +113,7 @@ def test_ocr_candidate_association_requires_measured_box_overlap():
 async def test_pipeline_reports_unavailable_engine_without_persisting_model_output(client, monkeypatch, tmp_path):
     from app.services import visual_forensics_pipeline
 
-    enabled = replace(settings, visual_forensics_enabled=True, trufor_worker_url="", visual_forensics_artifact_dir=str(tmp_path / "artifacts"))
+    enabled = replace(settings, visual_forensics_enabled=True, trufor_license_cleared=True, trufor_worker_url="", visual_forensics_artifact_dir=str(tmp_path / "artifacts"))
     monkeypatch.setattr(engine_module, "settings", enabled)
     monkeypatch.setattr(pipeline_module, "settings", enabled)
     from app.api.v1 import auth as auth_routes

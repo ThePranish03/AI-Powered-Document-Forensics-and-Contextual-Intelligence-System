@@ -1,7 +1,7 @@
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import select
@@ -101,11 +101,19 @@ async def append_audit(
     previous = await db.scalar(
         select(AuditChainEvent)
         .where(AuditChainEvent.investigation_id == investigation_id)
-        .order_by(AuditChainEvent.created_at.desc())
+        .order_by(AuditChainEvent.created_at.desc(), AuditChainEvent.id.desc())
     )
     previous_hash = previous.event_hash if previous else "genesis"
     event_id = uuid.uuid4()
     created_at = datetime.now(timezone.utc)
+    if previous is not None:
+        previous_created_at = previous.created_at
+        if previous_created_at.tzinfo is None:
+            previous_created_at = previous_created_at.replace(tzinfo=timezone.utc)
+        # The list endpoint uses creation time to display chain order. Ensure
+        # events appended in the same clock tick still sort in hash-chain order.
+        if created_at <= previous_created_at:
+            created_at = previous_created_at + timedelta(microseconds=1)
     record = AuditChainEvent(
         id=event_id,
         investigation_id=investigation_id,

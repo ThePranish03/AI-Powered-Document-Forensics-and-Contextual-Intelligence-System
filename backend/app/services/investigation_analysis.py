@@ -10,9 +10,12 @@ from app.models.entities import (
     DerivedGraphNode,
     Document,
     DossierSnapshot,
+    ExtractionRun,
     Finding,
     OCRResult,
+    PdfForensicRun,
     RelationshipAnalysis,
+    RelationshipCandidate,
     TimelineEvent,
     VisualAnalysisRun,
     VisualAnalysisPage,
@@ -21,8 +24,11 @@ from app.models.entities import (
 )
 from app.services.audit_chain import append_audit, verify_audit_chain
 from app.services.dossier_narrative import generate_grounded_narrative
+from app.services.evidence_correlation import correlate_pdf_text_and_visual
 from app.services.dossier_report import build_snapshot, render_html, snapshot_digest
-from app.services.ocr_metrics import analyze_documents, build_cross_document_correlation
+from app.services.ocr_metrics import analyze_documents, build_cross_document_correlation, extract_document_facts
+from app.services.relationship_index import _candidate_key
+from app.services.relationship_review import consistent_legacy_review_field, project_candidate_review, resolve_legacy_candidate_review, review_history_status
 
 ANALYZER_NAME = "deterministic_evidence"
 ANALYZER_VERSION = "1"
@@ -199,6 +205,21 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         .order_by(Document.created_at, Document.id)
     )).all()
     documents = [document for document, _result in document_rows]
+    extraction_runs = (await db.scalars(
+        select(ExtractionRun).join(Document, Document.id == ExtractionRun.document_id)
+        .where(Document.investigation_id == investigation.id)
+        .order_by(ExtractionRun.document_id, ExtractionRun.run_number)
+    )).all()
+    runs_by_document: dict[str, list[dict]] = {}
+    for run in extraction_runs:
+        runs_by_document.setdefault(str(run.document_id), []).append({
+            "id": str(run.id), "run_number": run.run_number, "provider": run.provider,
+            "provider_version": run.provider_version, "status": run.status,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+            "duration_ms": run.latency_ms, "error_detail": run.error_detail,
+            "configuration": run.configuration,
+        })
     findings = (await db.scalars(select(Finding).where(Finding.investigation_id == investigation.id))).all()
     timeline = (await db.scalars(select(TimelineEvent).where(TimelineEvent.investigation_id == investigation.id))).all()
     nodes = (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation.id))).all()
@@ -214,6 +235,12 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         .order_by(AuditChainEvent.created_at, AuditChainEvent.id)
     )).all()
     visual_runs = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation.id).order_by(VisualAnalysisRun.created_at, VisualAnalysisRun.id))).all()
+    pdf_runs = (await db.scalars(select(PdfForensicRun).where(PdfForensicRun.investigation_id == investigation.id).order_by(PdfForensicRun.created_at, PdfForensicRun.id))).all()
+    pdf_run_snapshot = [{
+        "id": str(run.id), "document_id": str(run.document_id), "source_sha256": run.source_sha256,
+        "status": run.status, "parser": {"name": run.parser_name, "version": run.parser_version},
+        "result": run.result, "created_at": run.created_at.isoformat(),
+    } for run in pdf_runs]
     visual_run_snapshot = []
     document_by_id = {str(document.id): document for document, _ in document_rows}
     for run in visual_runs:
@@ -235,6 +262,7 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         document = document_by_id.get(str(run.document_id))
         visual_run_snapshot.append({"id": str(run.id), "document_id": str(run.document_id), "source_sha256": document.sha256 if document else None, "status": run.status, "analyzer_version": run.analyzer_version, "model_version": (run.result or {}).get("engine", {}).get("model_version") if isinstance((run.result or {}).get("engine"), dict) else None, "result": run.result, "pages": page_items, "created_at": run.created_at.isoformat(), "completed_at": run.completed_at.isoformat() if run.completed_at else None, "error_detail": run.error_detail})
     version = (await db.scalar(select(func.max(DossierSnapshot.version)).where(DossierSnapshot.investigation_id == investigation.id)) or 0) + 1
+    structured_by_document = {str(document.id): record.payload for record, document in relationship_rows}
     correlation = build_cross_document_correlation([{
         "document_id": str(document.id),
         "filename": document.filename,
@@ -244,14 +272,125 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         "blocks": result.blocks if result else [],
         "text": result.recognized_text if result else "",
         "processing_status": document.processing_status,
+        "structured_extraction": structured_by_document.get(str(document.id)),
     } for document, result in document_rows])
-    nodes_by_id = {item.canonical_id: item for item in nodes}
+    deterministic_analysis = analyze_documents([{
+        "document_id": str(document.id), "filename": document.filename,
+        "sha256": document.sha256, "provider": result.provider if result else None,
+        "provider_version": result.provider_version if result else None,
+        "blocks": result.blocks if result else [], "text": result.recognized_text if result else "",
+        "processing_status": document.processing_status,
+        "structured_extraction": structured_by_document.get(str(document.id)),
+    } for document, result in document_rows])
+    fact_by_document = {
+        fact["document_id"]: fact
+        for fact in (extract_document_facts({
+            "document_id": str(document.id), "filename": document.filename,
+            "sha256": document.sha256, "provider": result.provider if result else None,
+            "provider_version": result.provider_version if result else None,
+            "blocks": result.blocks if result else [], "text": result.recognized_text if result else "",
+            "processing_status": document.processing_status,
+            "structured_extraction": structured_by_document.get(str(document.id)),
+        }) for document, result in document_rows)
+    }
+    candidates_by_key = {
+        item.candidate_key: item
+        for item in (await db.scalars(select(RelationshipCandidate).where(
+            RelationshipCandidate.investigation_id == investigation.id,
+        ))).all()
+    }
+    legacy_nodes_by_candidate_key = {}
+    for node in nodes:
+        key = _candidate_key(investigation.id, node.entity_type, node.label)
+        legacy_nodes_by_candidate_key.setdefault(key, []).append(node)
+    legacy_review_mappings = {}
+    for key, group in legacy_nodes_by_candidate_key.items():
+        candidate = candidates_by_key.get(key)
+        source_documents = (
+            candidate.document_ids if candidate is not None
+            else sorted({str(value) for node in group for value in (node.document_ids or [])})
+        )
+        legacy_review_mappings[key] = resolve_legacy_candidate_review(
+            investigation_id=investigation.id,
+            evidence_type=group[0].entity_type,
+            normalized_value=group[0].label,
+            candidate_document_ids=source_documents,
+            legacy_nodes=group,
+        )
     for link in correlation["links"]:
-        reviewed = nodes_by_id.get(link["id"])
-        if reviewed:
-            link["review_status"] = reviewed.review_status
-            link["review_reason"] = reviewed.review_reason
-            link["reviewed_at"] = reviewed.reviewed_at.isoformat() if reviewed.reviewed_at else None
+        candidate_key = _candidate_key(
+            investigation.id, link["identifier_type"], link["normalized_identifier"],
+        )
+        candidate = candidates_by_key.get(candidate_key)
+        legacy_review = legacy_review_mappings.get(candidate_key, {
+            "status": "unmatched", "reason": "no_exact_legacy_identity",
+            "review_status": None, "legacy_node_ids": [], "decisions": [],
+            "review_metadata": [], "review_history_available": False,
+            "review_history_limitation": None,
+        })
+        indexed_review_status = candidate.review_status if candidate is not None else None
+        projected_review = project_candidate_review(indexed_review_status, legacy_review)
+        if candidate is not None:
+            link["id"] = "detrel:" + candidate.candidate_key[:24]
+            link["candidate_key"] = candidate.candidate_key
+            link["lifecycle_status"] = candidate.lifecycle_status
+            link["review_history"] = candidate.review_history or []
+        if candidate is not None and candidate.review_status != "pending":
+            link["review_status"] = projected_review["review_status"]
+            link["review_reason"] = candidate.review_reason
+            link["reviewed_at"] = candidate.reviewed_at.isoformat() if candidate.reviewed_at else None
+            link["reviewed_by_user_id"] = str(candidate.reviewed_by_user_id) if candidate.reviewed_by_user_id else None
+            link["review_source"] = projected_review["review_source"]
+        elif legacy_review["status"] == "matched":
+            link["review_status"] = projected_review["review_status"]
+            link["review_reason"] = consistent_legacy_review_field(legacy_review, "review_reason")
+            reviewed_at = consistent_legacy_review_field(legacy_review, "reviewed_at")
+            reviewed_by = consistent_legacy_review_field(legacy_review, "reviewed_by_user_id")
+            link["reviewed_at"] = reviewed_at.isoformat() if reviewed_at else None
+            link["reviewed_by_user_id"] = reviewed_by
+            link["review_source"] = projected_review["review_source"]
+        elif legacy_review["status"] == "ambiguous":
+            link["review_status"] = projected_review["review_status"]
+            link["review_source"] = projected_review["review_source"]
+            link["review_reason"] = None
+            link["reviewed_at"] = None
+            link["reviewed_by_user_id"] = None
+        else:
+            link["review_source"] = None
+        link["indexed_review_status"] = indexed_review_status
+        link["review_mapping"] = legacy_review
+        if candidate is None:
+            link["review_history"] = []
+        link["review_history_status"] = review_history_status(link.get("review_history"), legacy_review)
+    dossier_nodes = []
+    for node in nodes:
+        key = _candidate_key(investigation.id, node.entity_type, node.label)
+        candidate = candidates_by_key.get(key)
+        mapping = legacy_review_mappings[key]
+        indexed_status = candidate.review_status if candidate is not None else None
+        projected = project_candidate_review(indexed_status, mapping)
+        if candidate is not None and candidate.review_status != "pending":
+            reviewed_by = candidate.reviewed_by_user_id
+            reviewed_at = candidate.reviewed_at
+            review_reason = candidate.review_reason
+        elif mapping["status"] == "matched":
+            reviewed_by = consistent_legacy_review_field(mapping, "reviewed_by_user_id")
+            reviewed_at = consistent_legacy_review_field(mapping, "reviewed_at")
+            review_reason = consistent_legacy_review_field(mapping, "review_reason")
+        else:
+            reviewed_by = reviewed_at = review_reason = None
+        history = candidate.review_history if candidate is not None else []
+        dossier_nodes.append({
+            "id": node.canonical_id, "label": node.label, "type": node.entity_type,
+            "document_ids": node.document_ids, "resolution": node.resolution, "basis": node.basis,
+            "review_status": projected["review_status"], "review_source": projected["review_source"],
+            "indexed_review_status": indexed_status,
+            "review_reason": review_reason,
+            "reviewed_at": reviewed_at.isoformat() if reviewed_at else None,
+            "reviewed_by_user_id": str(reviewed_by) if reviewed_by else None,
+            "review_mapping": mapping, "review_history": history,
+            "review_history_status": review_history_status(history, mapping),
+        })
     snapshot = build_snapshot(
         investigation={
             "id": str(investigation.id),
@@ -269,24 +408,30 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
             "content_type": item.content_type,
             "size_bytes": item.size_bytes,
             "processing_status": item.processing_status,
+            "processing_error": item.processing_error,
+            "processing_error_code": item.processing_error_code,
+            "processing_error_retryable": item.processing_error_retryable,
+            "processing_attempts": item.processing_attempts,
+            "relationship_extraction_attempts": item.relationship_extraction_attempts,
+            "relationship_extraction_status": (
+                "completed" if item.processing_status == "relationship_extraction_completed" else
+                "failed" if item.processing_status == "relationship_extraction_failed" else
+                "processing" if item.processing_status == "relationship_extraction_processing" else
+                "pending" if item.processing_status == "relationship_extraction_pending" else
+                "not_run"
+            ),
             "source_description": item.source_description,
             "uploaded_at": item.created_at.isoformat(),
             "extracted_text": (result.recognized_text if result else ""),
             "extracted_blocks": (result.blocks if result else []),
+            "extraction_coverage": ((result.raw_result or {}).get("extraction_coverage") if result and isinstance(result.raw_result, dict) else None),
+            "extraction_runs": runs_by_document.get(str(item.id), []),
+            "structured_fields": fact_by_document.get(str(item.id), {}).get("structured_fields", []),
+            "table_rows": fact_by_document.get(str(item.id), {}).get("table_rows", []),
         } for item, result in document_rows],
         findings=[_finding_dict(item) for item in findings],
         timeline=[_timeline_dict(item) for item in timeline],
-        nodes=[{
-            "id": item.canonical_id,
-            "label": item.label,
-            "type": item.entity_type,
-            "document_ids": item.document_ids,
-            "resolution": item.resolution,
-            "basis": item.basis,
-            "review_status": item.review_status,
-            "review_reason": item.review_reason,
-            "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else None,
-        } for item in nodes],
+        nodes=dossier_nodes,
         correlations=correlation["links"],
         discrepancies=correlation["contradictions"],
         audit_activity=[{
@@ -298,6 +443,7 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
         document_relationships=[{"document_id": str(document.id), "filename": document.filename, "payload": record.payload, "model": record.model, "schema_version": record.schema_version, "created_at": record.created_at.isoformat()} for record, document in relationship_rows],
         audit_verification=verify_audit_chain(audit_events),
         visual_runs=visual_run_snapshot,
+        pdf_runs=pdf_run_snapshot,
     )
     source_blocks = {
         (str(document.id), str(block.get("block_id"))): block
@@ -318,6 +464,8 @@ async def create_dossier(db: AsyncSession, investigation, actor_id: UUID) -> Dos
     snapshot["timeline"] = enrich_references(snapshot["timeline"])
     snapshot["cross_document_links"] = enrich_references(snapshot["cross_document_links"])
     snapshot["cross_document_discrepancies"] = enrich_references(snapshot["cross_document_discrepancies"])
+    snapshot["cross_method_correlations"] = correlate_pdf_text_and_visual(pdf_run_snapshot, visual_run_snapshot)
+    snapshot["findings_diagnostics"] = deterministic_analysis["diagnostics"]
     snapshot["ai_narrative"] = await generate_grounded_narrative(snapshot)
     report_id = uuid.uuid4()
     created_at = datetime.now(timezone.utc)

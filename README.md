@@ -284,7 +284,7 @@ flowchart LR
     VIS --> REVIEW
     REVIEW --> DOS[Dossier snapshots and exports]
     API --> AUDIT[Hash-linked audit events]
-    LLM[Optional Grok provider] -. configured extraction / narrative .-> REL
+    LLM[Optional Groq provider] -. configured extraction / narrative .-> REL
     LLM -. evidence-grounded narrative .-> DOS
 ```
 
@@ -379,7 +379,7 @@ flowchart TD
 | OCR runtime | PaddlePaddle / PaddleX | PaddleOCR execution dependencies. |
 | Image processing | OpenCV + NumPy | Image operations and available measured visual signals. |
 | PDF processing | PyMuPDF | PDF pages, text and object inspection where used. |
-| LLM | xAI Grok via xAI API or Vercel AI Gateway | Optional structured relationship extraction and evidence-grounded narrative. |
+| LLM | Groq API (`openai/gpt-oss-120b` by default) | Optional structured relationship extraction and evidence-grounded narrative. |
 | PDF report | ReportLab | PDF generation in the later dossier implementation. |
 | Orchestration | Docker Compose / PowerShell launcher | Local multi-service startup. |
 | Backend tests | pytest | Backend unit and integration tests. |
@@ -522,11 +522,13 @@ Relationship analysis organizes extracted mentions and explicit references into 
 
 **1. Deterministic identifier relationships**
 
-The backend can identify exact typed identifiers across documents and create candidate links. For example, a purchase-order identifier appearing in a purchase order and an invoice can connect the two records for inspection.
+The backend links exact typed identifiers and normalized email addresses, labeled phone numbers/IPs, registration or tax IDs, and explicitly labeled person or organization names across documents. Every link includes the source document, page, block, quoted text, normalization, and matching rule. Dates and currency amounts are comparison fields, not identity keys. These links appear as unconfirmed candidates as soon as stored OCR is available; the correlation view refreshes while processing continues.
 
 **2. Optional structured relationship extraction**
 
-When configured, Grok can propose structured entity and relationship information from OCR content. The output should be validated and tied to exact source blocks. This path is optional and can fail if provider configuration, availability or billing is not available.
+When configured, Groq can propose structured entity and relationship information from OCR content. The output is schema-validated and tied to exact source blocks. This path is optional and can fail if provider configuration, availability or billing is not available. Dossier narratives use the same Groq client, model configuration, and backend-only API key.
+
+Unchanged completed results are reused only when the source blocks, model, prompt version, schema, and extraction configuration match. Partial retries reuse only matching completed chunks. Run metadata records input preparation, chunk creation, provider request, response parsing, grounding, entity merge, relationship merge, and checkpoint persistence timings. Deterministic candidate matching uses a bounded process-local cache keyed by the complete OCR and structured-evidence input; review state is overlaid after cache lookup.
 
 ### Relationship types (conceptual examples)
 
@@ -641,9 +643,9 @@ An investigator can record a note or rationale with the review action. Acceptanc
 
 Visual analysis requires careful interpretation.
 
-The repository README currently describes visual review as manual and states that automated font, copy-move, compression and forgery checks are unavailable as a complete capability. The inspected service source contains measured visual-analysis routines and the API has a per-document visual-analysis-run path, but code presence does not establish that every check is enabled, validated or available in a given deployment.
+The application includes deterministic visual checks and a PDF structural inspection path. Results remain source-linked observations. Check status is shown per run because support depends on the file type and runtime.
 
-The current deployment must be checked for per-check status before the feature is described as operational.
+PDF structure analysis records parser-visible objects, document metadata, native text geometry, fonts, images, attachments, revisions and parser recovery. It compares OCR against native text only when persisted render geometry validates, inventories classic-xref revision changes, and checks signature integrity with pyHanko while keeping trust separate. Parsing runs in a resource-limited child process. See [PDF structural analysis](docs/pdf-structural-analysis.md) for the API, synthetic benchmark and limitations.
 
 ### Visual checks represented in inspected source
 
@@ -663,6 +665,8 @@ The current deployment must be checked for per-check status before the feature i
 5. Inspect candidate region boxes and measurements.
 6. Open the original page and manually inspect the region.
 7. Record an investigator disposition where supported.
+
+For a PDF, use **Analyze PDF structure** in the Visual Forensics workspace to persist a source-hash-bound report. The overview shows coverage; dossier snapshots include saved reports and deterministic cross-method links with source references.
 
 ### Meaning of a completed run with zero observations
 
@@ -718,7 +722,7 @@ A dossier can consolidate stored data such as:
 
 Each saved snapshot should be treated as an immutable report version. Its integrity digest is checked before export. Export actions should be auditable. A failed integrity check should block the download rather than silently returning modified content.
 
-Optional LLM narrative generation is configuration- and provider-dependent. The implementation summary says narrative claims must resolve to exact stored OCR block text; if citations cannot be resolved, the narrative is omitted. A previously reported provider billing error means successful live model narrative generation should not be promised until tested.
+Optional Groq narrative generation is configuration-dependent. Narrative claims must resolve to exact stored OCR block text; if citations cannot be resolved, the narrative is omitted. Live connectivity is not implied by configured credentials and must be checked with the connectivity script.
 
 ---
 
@@ -726,12 +730,9 @@ Optional LLM narrative generation is configuration- and provider-dependent. The 
 
 ### Provider configuration
 
-The repository documents optional relationship extraction through:
+Every LLM-dependent feature uses the centralized Groq OpenAI-compatible Chat Completions client at `https://api.groq.com/openai/v1/chat/completions`. It authenticates only with the backend `GROQ_API_KEY`. There is no provider selector or fallback; obsolete provider variables cause startup configuration to fail clearly. `GROQ_MODEL` explicitly selects the Groq model (default `openai/gpt-oss-120b`). API credentials are never exposed to the frontend.
 
-- Direct xAI API.
-- Vercel AI Gateway.
-
-Relationship extraction is disabled unless `RELATIONSHIP_EXTRACTION_ENABLED=true` and provider credentials/configuration are set in the backend environment.
+Relationship extraction remains disabled unless `RELATIONSHIP_EXTRACTION_ENABLED=true`. Dossier narrative generation is optional and is omitted when there are no source OCR blocks or the provider is unavailable.
 
 ### Appropriate model tasks
 
@@ -836,32 +837,33 @@ The tree above is a high-level guide; exact filenames and feature-module organiz
 | `ACCESS_TOKEN_MINUTES` | Access-token lifetime. |
 | `REFRESH_TOKEN_DAYS` | Refresh-token lifetime. |
 | `DOCUMENT_STORAGE_PATH` | Private document storage directory. |
-| `XAI_API_KEY` | Optional server-side LLM provider key. |
-| `XAI_BASE_URL` | Direct xAI or Vercel AI Gateway endpoint. |
-| `XAI_MODEL` | Configured provider model. |
+| `GROQ_API_KEY` | Backend-only Groq API credential. Never place it in frontend `VITE_*` variables. |
+| `GROQ_MODEL` | Groq model ID; defaults to `openai/gpt-oss-120b`. The request will not fall back if the model is unavailable. |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | Shared LLM request read timeout; defaults to 240 seconds and accepts 1–300 seconds. |
+| `LLM_RELATIONSHIP_CHUNK_CHARACTERS` | Maximum source characters per relationship request; defaults to 4500 and accepts 1000–12000. |
+| `LLM_RELATIONSHIP_CHUNK_OVERLAP` | Source characters repeated across adjacent chunks where a whole-block overlap fits; defaults to 400. |
+| `LLM_RELATIONSHIP_COMPLETION_TOKENS` | Maximum completion tokens per relationship request; defaults to 8192 and accepts 512–32768. |
+| `LLM_CONNECTIVITY_TIMEOUT_SECONDS` | Prompt-only checker timeout; defaults to the request timeout and accepts 1–300 seconds. |
 | `RELATIONSHIP_EXTRACTION_ENABLED` | Enables optional relationship extraction when set to `true`. |
 
 ### Optional relationship extraction
 
 Relationship extraction is disabled unless explicitly enabled and configured in `backend/.env`.
 
-**Vercel AI Gateway example:**
+**Groq example:**
 
 ```dotenv
 RELATIONSHIP_EXTRACTION_ENABLED=true
-XAI_BASE_URL=https://ai-gateway.vercel.sh/v1
-XAI_MODEL=spacexai/grok-4.7
-XAI_API_KEY=your-server-side-provider-key
+GROQ_API_KEY=your-groq-api-key
+GROQ_MODEL=openai/gpt-oss-120b
+LLM_REQUEST_TIMEOUT_SECONDS=240
+LLM_CONNECTIVITY_TIMEOUT_SECONDS=240
+LLM_RELATIONSHIP_CHUNK_CHARACTERS=4500
+LLM_RELATIONSHIP_CHUNK_OVERLAP=400
+LLM_RELATIONSHIP_COMPLETION_TOKENS=8192
 ```
 
-**Direct xAI example:**
-
-```dotenv
-RELATIONSHIP_EXTRACTION_ENABLED=true
-XAI_BASE_URL=https://api.x.ai/v1
-XAI_MODEL=grok-4.7
-XAI_API_KEY=your-server-side-provider-key
-```
+Set `GROQ_API_KEY` and optional `GROQ_MODEL` in `backend/.env`. Never commit `.env`. The API and OCR worker receive the same `backend/.env` in local Docker Compose, while the local API and worker load the same backend settings module. Run `python -m scripts.check_llm_connectivity` from `backend` only when an explicitly authorized live connectivity check is intended; it sends the prompt `Reply with exactly OK.`. The checker reports `CONFIGURED` separately from `CONNECTED` and never prints credentials, headers or response bodies. Relationship extraction runs after OCR only when its feature gate is enabled; dossier generation requests a narrative only when OCR blocks exist. Missing credentials and provider failures produce explicit failure/unavailable states. They never invoke another provider or model.
 
 These are configuration examples, not embedded credentials. Never place provider secrets in frontend `VITE_*` variables. Provider billing and availability can affect live inference.
 
@@ -916,7 +918,11 @@ The OCR evaluation harness can calculate CER/WER from supplied text files and cr
 
 The following limitations are documented in the repository or supplied implementation notes. Check the current deployed branch before presenting a capability as live and complete.
 
-- **Visual forensics:** the README describes manual visual review and states automated font, copy-move, compression and forgery checks are unavailable as a complete capability. Some later service/API work may contain measured routines, but each check must be validated and its per-check status exposed before claiming it is operational.
+- **PDF structure:** analysis uses PyMuPDF as an application parser, not a complete ISO 32000 validator. Revision xref entry changes are reported for classic xref tables; xref-stream and hybrid-reference files and object-body diffs remain unsupported. pyHanko checks signature integrity and coverage; the default configuration does not establish signer trust or fetch revocation data. XMP is reported as present/absent, not compared across revisions. Encrypted PDFs without a password return unavailable. See [PDF structural analysis](docs/pdf-structural-analysis.md).
+- **PDF text/OCR comparison:** disagreement observations require OCR output created with persisted raster dimensions and transforms that validate against PDF page geometry. Older OCR runs and invalid boxes are explicitly unavailable/skipped; no inferred scaling is applied.
+- **Synthetic benchmark:** the five-fixture dataset measures a revision-change heuristic and signature-byte integrity on controlled files. It is too small for general accuracy estimates and does not benchmark real OCR or model methods.
+- **Embedded image extraction:** eligible image bytes are stored as source-linked private artifacts with their own hash and are checked again on access. Size-limited or unsupported extractions are labeled unavailable.
+- **Visual forensics:** deterministic screening checks and a TruFor adapter exist. A TruFor worker and verified checkpoint are not included; the feature remains unavailable unless an authorized worker is configured. Never interpret a missing model output as a clean result.
 - **Upload formats:** application uploads are documented as PDF, JPEG, PNG and TIFF. Broader format lists in planning documents are not proof of application support.
 - **Relationship extraction:** optional, disabled by default and dependent on configured provider access and billing.
 - **Entity resolution:** exact typed identifier matching is available; fuzzy identity resolution and general-purpose semantic matching are not documented as implemented.

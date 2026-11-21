@@ -1,9 +1,11 @@
 import asyncio
 import hashlib
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID
+from time import perf_counter
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -14,11 +16,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db, require_csrf, require_permission
 from app.api.v1.investigations import owned_investigation, stored_document_path
 from app.core.config import settings
-from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, EvidencePage, EvidenceSpan, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, TimelineEvent, User, VisualAnalysisArtifact, VisualAnalysisPage, VisualAnalysisRun, VisualCandidateRegion
+from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, EvidencePage, EvidenceSpan, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, PdfForensicArtifact, PdfForensicRun, RelationshipAnalysis, RelationshipCandidate, TimelineEvent, User, VisualAnalysisArtifact, VisualAnalysisPage, VisualAnalysisRun, VisualCandidateRegion
 from app.services.audit_chain import append_audit, verify_audit_chain
 from app.services.dossier_report import render_pdf, snapshot_digest
 from app.services.investigation_analysis import _finding_dict, _timeline_dict, create_dossier, run_investigation_analysis
-from app.services.ocr_metrics import build_cross_document_correlation, evaluate_samples
+from app.services.evidence_correlation import correlate_pdf_text_and_visual
+from app.services.ocr_metrics import evaluate_samples
+from app.services.pdf_forensics import analyze_pdf_isolated, compare_pdf_native_text_to_ocr
+from app.services.relationship_index import _candidate_key, build_comparison_views
+from app.services.relationship_review import consistent_legacy_review_field, project_candidate_review, resolve_legacy_candidate_review, review_history_status
 from app.services.visual_forensics import analyze_file
 from app.services.visual_forensics_engine import engine_health_payload
 from app.services.visual_forensics_pipeline import run_engine_pipeline
@@ -78,39 +84,232 @@ class VisualRegionReview(BaseModel):
     review_notes: str | None = Field(default=None, max_length=4000)
 
 
+def _pdf_forensic_run_payload(run: PdfForensicRun) -> dict:
+    return {
+        "id": str(run.id),
+        "investigation_id": str(run.investigation_id),
+        "document_id": str(run.document_id),
+        "source_sha256": run.source_sha256,
+        "status": run.status,
+        "parser": {"name": run.parser_name, "version": run.parser_version},
+        "created_at": run.created_at.isoformat(),
+        "result": run.result,
+    }
+
+
+def _pdf_artifact_run_dir(run_id: UUID) -> Path:
+    root = Path(settings.document_storage_path).resolve() / "pdf_artifacts"
+    candidate = root / run_id.hex
+    if candidate.is_symlink():
+        raise HTTPException(status_code=500, detail="PDF artifact storage is unavailable")
+    target = candidate.resolve()
+    if target.parent != root.resolve():
+        raise HTTPException(status_code=500, detail="PDF artifact storage is unavailable")
+    return target
+
+
 async def _correlation_data(db: AsyncSession, investigation_id: UUID) -> dict:
-    rows = (await db.execute(
-        select(Document, OCRResult)
-        .outerjoin(OCRResult, OCRResult.document_id == Document.id)
-        .where(Document.investigation_id == investigation_id)
-        .order_by(Document.created_at, Document.id)
-    )).all()
-    documents = [{
-        "document_id": str(document.id),
-        "filename": document.filename,
-        "sha256": document.sha256,
-        "provider": result.provider if result else None,
-        "provider_version": result.provider_version if result else None,
-        "blocks": result.blocks if result else [],
-        "text": result.recognized_text if result else "",
-        "processing_status": document.processing_status,
-    } for document, result in rows]
-    payload = build_cross_document_correlation(documents)
+    started = perf_counter()
+    documents = (await db.scalars(select(Document).where(Document.investigation_id == investigation_id))).all()
+    document_ids = [item.id for item in documents]
+    documents_by_id = {str(item.id): item for item in documents}
+    documents_with_ocr = await db.scalar(select(func.count(func.distinct(OCRResult.document_id))).where(
+        OCRResult.document_id.in_(document_ids),
+    )) if document_ids else 0
+    comparison_facts_by_document = {}
+    if document_ids:
+        relationship_rows = (await db.scalars(select(RelationshipAnalysis).where(
+            RelationshipAnalysis.document_id.in_(document_ids),
+        ))).all()
+        for record in relationship_rows:
+            payload = record.payload if isinstance(record.payload, dict) else {}
+            deterministic = payload.get("deterministic_analysis") if isinstance(payload.get("deterministic_analysis"), dict) else {}
+            comparison_facts = deterministic.get("comparison_facts")
+            current_document = documents_by_id.get(str(record.document_id))
+            if (
+                isinstance(comparison_facts, dict)
+                and current_document is not None
+                and comparison_facts.get("source_sha256") == current_document.sha256
+            ):
+                comparison_facts_by_document[str(record.document_id)] = comparison_facts
+    candidates = (await db.scalars(select(RelationshipCandidate).where(
+        RelationshipCandidate.investigation_id == investigation_id,
+    ).order_by(RelationshipCandidate.created_at, RelationshipCandidate.candidate_key))).all()
+    indexed_candidate_keys = {item.candidate_key for item in candidates}
     review_nodes = {
         item.canonical_id: item
         for item in (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation_id))).all()
     }
-    for link in payload["links"]:
-        item = review_nodes.get(link["id"])
-        if item:
-            link["review_status"] = item.review_status
-            link["reviewed_at"] = item.reviewed_at.isoformat() if item.reviewed_at else None
-            link["review_reason"] = item.review_reason
-    payload["summary"]["confirmed_links"] = sum(link["review_status"] == "confirmed" for link in payload["links"])
-    payload["summary"]["rejected_links"] = sum(link["review_status"] == "rejected" for link in payload["links"])
-    payload["summary"]["unreviewed_links"] = sum(link["review_status"] == "candidate" for link in payload["links"])
-    payload["summary"]["candidate_links"] = payload["summary"]["unreviewed_links"]
-    return payload
+    links = []
+    for item in candidates:
+        stable_id = "detrel:" + item.candidate_key[:24]
+        current_refs = [
+            ref for ref in (item.evidence_refs or [])
+            if str(ref.get("document_id")) in documents_by_id
+            and ref.get("source_sha256") == documents_by_id[str(ref.get("document_id"))].sha256
+        ]
+        current_document_ids = sorted({str(ref["document_id"]) for ref in current_refs})
+        legacy_review = resolve_legacy_candidate_review(
+            investigation_id=investigation_id,
+            evidence_type=item.evidence_type,
+            normalized_value=item.normalized_value,
+            candidate_document_ids=current_document_ids,
+            legacy_nodes=review_nodes.values(),
+        )
+        indexed_review_status = item.review_status
+        projected_review = project_candidate_review(indexed_review_status, legacy_review)
+        legacy_review_at = consistent_legacy_review_field(legacy_review, "reviewed_at") if legacy_review["status"] == "matched" else None
+        legacy_review_by = consistent_legacy_review_field(legacy_review, "reviewed_by_user_id") if legacy_review["status"] == "matched" else None
+        legacy_review_reason = consistent_legacy_review_field(legacy_review, "review_reason") if legacy_review["status"] == "matched" else None
+        links.append({
+            "id": stable_id, "candidate_key": item.candidate_key,
+            "relation_type": "shared_case_link" if item.evidence_type == "CASE_LINK" else "shared_document_identifier" if item.evidence_type in {"INVOICE", "PURCHASE_ORDER", "TRANSACTION", "REFERENCE", "ACCOUNT", "VENDOR", "DOCUMENT_ID"} else "shared_deterministic_identifier",
+            "normalized_identifier": item.normalized_value,
+            "identifier_type": item.evidence_type,
+            "document_ids": current_document_ids, "document_count": len(current_document_ids),
+            "rank": 1.0, "rank_kind": "exact_rule_match",
+            "method": "deterministic_relationship_index_v2",
+            "explanation": item.explanation, "evidence_kind": "deterministic_source_match",
+            "limitations": "Exact labeled identifiers are review leads; they do not establish a common party or transaction.",
+            "explicit_or_inferred": "explicit", "evidence_refs": [
+                {**ref, "quoted_text": ref.get("raw_value"), "field_type": ref.get("field_type") or ref.get("evidence_type")}
+                for ref in current_refs
+            ],
+            "review_status": projected_review["review_status"],
+            "indexed_review_status": indexed_review_status,
+            "review_source": projected_review["review_source"],
+            "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else (legacy_review_at.isoformat() if legacy_review_at else None),
+            "review_reason": item.review_reason or legacy_review_reason,
+            "reviewed_by_user_id": str(item.reviewed_by_user_id) if item.reviewed_by_user_id else legacy_review_by,
+            "review_mapping": legacy_review,
+            "lifecycle_status": "stale" if len(current_document_ids) < 2 else item.lifecycle_status,
+            "first_seen_at": item.first_seen_at.isoformat(), "last_seen_at": item.last_seen_at.isoformat(),
+            "review_history": item.review_history,
+            "review_history_status": review_history_status(item.review_history, legacy_review),
+        })
+    represented_legacy_ids = {
+        "detrel:" + hashlib.sha256(f"{link['identifier_type']}|{link['normalized_identifier']}".encode()).hexdigest()[:24]
+        for link in links if link.get("candidate_key")
+    }
+    legacy_groups = {}
+    for node in review_nodes.values():
+        key = _candidate_key(investigation_id, node.entity_type, node.label)
+        legacy_groups.setdefault(key, []).append(node)
+    for key, nodes in legacy_groups.items():
+        if key in indexed_candidate_keys:
+            continue
+        group_documents = sorted({str(doc_id) for node in nodes for doc_id in (node.document_ids or [])})
+        mapping = resolve_legacy_candidate_review(
+            investigation_id=investigation_id,
+            evidence_type=nodes[0].entity_type,
+            normalized_value=nodes[0].label,
+            candidate_document_ids=group_documents,
+            legacy_nodes=nodes,
+        )
+        for node in sorted(nodes, key=lambda item: item.canonical_id):
+            if any(link["id"] == node.canonical_id for link in links) or node.canonical_id in represented_legacy_ids:
+                continue
+            projected_status = "ambiguous" if mapping["status"] == "ambiguous" else mapping["review_status"]
+            links.append({
+                "id": node.canonical_id, "candidate_key": None, "relation_type": "legacy_candidate",
+                "normalized_identifier": node.label, "identifier_type": node.entity_type,
+                "document_ids": node.document_ids, "document_count": len(node.document_ids),
+                "rank": 1.0, "rank_kind": node.resolution, "method": "legacy_derived_graph_node",
+                "explanation": node.basis, "evidence_kind": "legacy_candidate", "evidence_refs": [],
+                "review_status": projected_status, "reviewed_at": node.reviewed_at.isoformat() if node.reviewed_at else None,
+                "review_reason": node.review_reason, "lifecycle_status": "legacy",
+                "review_mapping": mapping, "review_history": [],
+                "review_history_status": "legacy_history_unavailable",
+            })
+    pending = any(doc.processing_status in {"queued", "processing", "relationship_extraction_pending", "relationship_extraction_processing"} for doc in documents)
+    failed = any(doc.processing_status in {"failed", "relationship_extraction_failed"} for doc in documents)
+    comparisons, comparison_by_id = build_comparison_views(links, comparison_facts_by_document)
+    stored_findings = (await db.scalars(select(Finding).where(
+        Finding.investigation_id == investigation_id,
+        Finding.finding_type == "identifier_amount_conflict",
+    ))).all()
+    contradictions = []
+    findings_by_value = {}
+    for finding in stored_findings:
+        conflict = comparison_by_id.get(next((str(ref.get("identifier")) for ref in (finding.evidence_refs or []) if ref.get("identifier")), ""))
+        if conflict is None:
+            continue
+        refs_are_current = all(
+            str(ref.get("document_id")) in documents_by_id
+            and ref.get("source_sha256") == documents_by_id[str(ref.get("document_id"))].sha256
+            for ref in (finding.evidence_refs or [])
+        )
+        if refs_are_current:
+            contradictions.append({**_finding_dict(finding), "finding_id": str(finding.id), "id": finding.fingerprint})
+            findings_by_value[conflict["value"]] = True
+    # When only the indexed facts exist, reconstruct the previous contradiction
+    # view from those persisted, cited totals. This is a deterministic response
+    # projection and does not read OCR blocks or write a Finding during GET.
+    for value, comparison in comparison_by_id.items():
+        if findings_by_value.get(value):
+            continue
+        link = next((item for item in links if item.get("candidate_key") and item["normalized_identifier"] == value), None)
+        if link is None:
+            continue
+        identifier_refs = {str(ref.get("document_id")): ref for ref in link.get("evidence_refs", [])}
+        evidence_refs = []
+        totals = []
+        for entry in comparison["documents"]:
+            total = entry.get("total")
+            if not total:
+                continue
+            total_ref = total["evidence_ref"]
+            identifier_ref = identifier_refs.get(str(entry["document_id"]), {})
+            totals.append(str(total.get("raw")))
+            evidence_refs.append({
+                **total_ref, "identifier": value,
+                "identifier_block_id": identifier_ref.get("block_id"),
+                "related_total": total.get("raw"),
+                "normalized_total": total.get("value"),
+                "normalization_warnings": [],
+            })
+        if len(totals) < 2:
+            continue
+        fingerprint = f"conflict:{value}"
+        contradictions.append({
+            "id": fingerprint, "finding_type": "identifier_amount_conflict",
+            "title": f"Identifier {value} has conflicting labeled totals",
+            "description": "The same typed identifier is paired with different persisted labeled totals: " + "; ".join(totals) + ". This is a candidate discrepancy to review, not proof that either document is false.",
+            "severity": "high", "confidence": 0.7, "status": "candidate",
+            "analyzer_name": "deterministic_evidence", "analyzer_version": "1",
+            "method": "shared_identifier_total_conflict", "evidence_refs": evidence_refs,
+            "limitations": "Totals are OCR/native extracted values; verify them against original source evidence.",
+            "review_notes": None, "reviewed_by_user_id": None, "reviewed_at": None,
+        })
+    return {
+        "status": "no_documents" if not documents else "ready" if documents_with_ocr else "no_ocr_results",
+        "method": "indexed_deterministic_candidates_v2",
+        "summary": {
+            "documents_total": len(documents), "documents_with_ocr": documents_with_ocr or 0,
+            "documents_pending": sum(doc.processing_status in {"queued", "processing", "relationship_extraction_pending", "relationship_extraction_processing"} for doc in documents),
+            "documents_with_processing_errors": sum(doc.processing_status in {"failed", "relationship_extraction_failed"} for doc in documents),
+            "identifier_mentions": sum(len(item.get("identifiers", [])) for item in comparison_facts_by_document.values()),
+            "candidate_entities": len(candidates),
+            "candidate_links": sum(item["review_status"] in {"candidate", "pending"} for item in links),
+            # An indexed decision remains authoritative for review_status even
+            # when conflicting legacy records make the fallback mapping
+            # ambiguous. Count that diagnostic independently of projection.
+            "ambiguous_review_links": sum(
+                (item.get("review_mapping") or {}).get("status") == "ambiguous"
+                for item in links
+            ),
+            "total_links": len(links),
+            "deterministic_candidate_links": sum(link.get("candidate_key") is not None for link in links),
+            "confirmed_links": sum(item["review_status"] == "confirmed" for item in links),
+            "rejected_links": sum(item["review_status"] == "rejected" for item in links),
+            "unreviewed_links": sum(item["review_status"] in {"candidate", "pending"} for item in links),
+            "contradictions": len(contradictions),
+        },
+        "links": links, "comparisons": comparisons, "contradictions": contradictions,
+        "limitations": "Exact labeled identifiers are candidate links, not identity or transaction proof. Dates and amounts are comparison signals only. OCR uncertainty and unlabeled fields can affect results.",
+        "semantic_enrichment": {"status": "pending" if pending else "partial" if failed else "ready"},
+        "timings_ms": {"cache_hit": True, "deterministic_candidate_generation": round((perf_counter() - started) * 1000, 3)},
+    }
 
 
 def _dossier_summary(item: DossierSnapshot) -> dict:
@@ -376,7 +575,7 @@ async def rerun_cross_document_correlation(investigation_id: UUID, request: Requ
         action="correlation.completed",
         target_type="investigation",
         target_id=str(investigation.id),
-        details={"method": "deterministic_exact_identifier_v1", "documents_considered": result["documents_considered"]},
+        details={"method": "hybrid_deterministic_exact_v2", "documents_considered": result["documents_considered"]},
     )
     await db.commit()
     return await _correlation_data(db, investigation_id)
@@ -403,7 +602,7 @@ async def review_correlation_candidate(investigation_id: UUID, canonical_id: str
             label=link["normalized_identifier"],
             entity_type=link["identifier_type"],
             document_ids=link["document_ids"],
-            resolution="identifier_match",
+            resolution="case_link_match" if link["relation_type"] == "shared_case_link" else "exact_entity_candidate" if link["relation_type"] == "shared_canonical_entity" else "identifier_match",
             basis=link["explanation"],
         )
         db.add(node)
@@ -413,6 +612,23 @@ async def review_correlation_candidate(investigation_id: UUID, canonical_id: str
     node.review_reason = payload.reason.strip()
     if not node.review_reason:
         raise HTTPException(status_code=422, detail="Review reason must not be blank")
+    candidate = None
+    if link.get("candidate_key"):
+        candidate = await db.scalar(select(RelationshipCandidate).where(
+            RelationshipCandidate.investigation_id == investigation_id,
+            RelationshipCandidate.candidate_key == link["candidate_key"],
+        ))
+    if candidate:
+        history = list(candidate.review_history or [])
+        history.append({
+            "status": payload.status, "reason": node.review_reason,
+            "reviewed_by_user_id": str(user.id), "reviewed_at": node.reviewed_at.isoformat(),
+        })
+        candidate.review_status = payload.status
+        candidate.reviewed_by_user_id = user.id
+        candidate.reviewed_at = node.reviewed_at
+        candidate.review_reason = node.review_reason
+        candidate.review_history = history
     await append_audit(
         db,
         investigation_id=investigation_id,
@@ -426,6 +642,7 @@ async def review_correlation_candidate(investigation_id: UUID, canonical_id: str
     return {
         "id": canonical_id,
         "review_status": node.review_status,
+        "lifecycle_status": candidate.lifecycle_status if candidate else "legacy",
         "reviewed_at": node.reviewed_at.isoformat(),
         "review_reason": node.review_reason,
     }
@@ -535,6 +752,203 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+@router.post("/{investigation_id}/documents/{document_id}/pdf-forensics", status_code=201)
+async def analyze_pdf_structure(
+    investigation_id: UUID,
+    document_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission("investigations:update")),
+):
+    require_csrf(request)
+    await owned_investigation(db, user, investigation_id)
+    document = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if document.content_type != "application/pdf":
+        raise HTTPException(status_code=415, detail="PDF structural analysis is available for PDF sources")
+    if not document.sha256:
+        raise HTTPException(status_code=409, detail="Source evidence has no recorded SHA-256")
+    path = stored_document_path(document)
+    run_id = uuid4()
+    artifact_dir = _pdf_artifact_run_dir(run_id)
+    try:
+        result = await asyncio.to_thread(analyze_pdf_isolated, path, document.sha256, artifact_dir=artifact_dir)
+    except ValueError as exc:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+        detail = str(exc)
+        if "SHA-256" in detail:
+            raise HTTPException(status_code=409, detail="Stored evidence hash does not match its recorded SHA-256") from exc
+        raise HTTPException(status_code=422, detail=detail) from exc
+    except TimeoutError as exc:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+        raise HTTPException(status_code=504, detail="PDF structural analysis exceeded its process timeout") from exc
+    except Exception as exc:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+        raise HTTPException(status_code=422, detail="PDF structural analysis could not parse this source") from exc
+
+    ocr_result = await db.scalar(select(OCRResult).where(OCRResult.document_id == document.id))
+    if ocr_result and isinstance(ocr_result.blocks, list):
+        pages_by_number = {}
+        for block in ocr_result.blocks:
+            if not isinstance(block, dict) or not isinstance(block.get("page_index"), int):
+                continue
+            page_number = block["page_index"] + 1
+            geometry = block.get("page_geometry")
+            if isinstance(geometry, dict):
+                pages_by_number[page_number] = {"page_number": page_number, "width": geometry.get("render_width_px"), "height": geometry.get("render_height_px")}
+        result["text_comparison"] = compare_pdf_native_text_to_ocr(result, list(pages_by_number.values()), ocr_result.blocks)
+    else:
+        result["text_comparison"] = {"schema_version": "native_text_ocr_comparison_v1", "status": "unavailable", "method": "validated_pixel_to_pdf_bbox_overlap_and_normalized_text_comparison", "discrepancies": [], "skipped_pages": [], "limitations": ["No OCR result was available when this immutable PDF analysis run was created."]}
+
+    artifact_records = result.pop("artifacts", [])
+    run = PdfForensicRun(
+        id=run_id,
+        investigation_id=investigation_id,
+        document_id=document.id,
+        source_sha256=document.sha256,
+        status=result["status"],
+        parser_name=result["parser"]["name"],
+        parser_version=result["parser"]["version"],
+        result=result,
+        created_by_user_id=user.id,
+    )
+    db.add(run)
+    try:
+        await db.flush()
+        for artifact in artifact_records:
+            db.add(PdfForensicArtifact(
+                id=UUID(artifact["id"]), investigation_id=investigation_id,
+                document_id=document.id, run_id=run.id, object_number=artifact["object_number"],
+                source_sha256=document.sha256, storage_key=artifact["storage_key"],
+                mime_type=artifact["mime_type"], byte_size=artifact["byte_size"],
+                width_px=artifact["width_px"], height_px=artifact["height_px"], sha256=artifact["sha256"],
+            ))
+        await append_audit(
+            db,
+            investigation_id=investigation_id,
+            actor_user_id=user.id,
+            action="evidence.pdf_structure_analyzed",
+            target_type="pdf_forensic_run",
+            target_id=str(run.id),
+            details={"document_id": str(document.id), "source_sha256": document.sha256, "status": run.status, "page_count": result["document"]["page_count"], "extracted_image_count": len(artifact_records)},
+        )
+        await db.commit()
+        await db.refresh(run)
+    except Exception:
+        await db.rollback()
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+        raise
+    return _pdf_forensic_run_payload(run)
+
+
+@router.get("/{investigation_id}/documents/{document_id}/pdf-forensics/latest")
+async def latest_pdf_structure(
+    investigation_id: UUID,
+    document_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission("investigations:read")),
+):
+    await owned_investigation(db, user, investigation_id)
+    document = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    run = await db.scalar(
+        select(PdfForensicRun)
+        .where(PdfForensicRun.document_id == document.id, PdfForensicRun.investigation_id == investigation_id)
+        .order_by(PdfForensicRun.created_at.desc(), PdfForensicRun.id.desc())
+    )
+    return {"item": _pdf_forensic_run_payload(run) if run else None}
+
+
+@router.get("/{investigation_id}/pdf-forensics/summary")
+async def pdf_structure_summary(
+    investigation_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission("investigations:read")),
+):
+    await owned_investigation(db, user, investigation_id)
+    pdf_documents = (await db.scalars(select(Document).where(
+        Document.investigation_id == investigation_id,
+        Document.content_type == "application/pdf",
+    ))).all()
+    rows = (await db.execute(
+        select(PdfForensicRun, Document)
+        .join(Document, Document.id == PdfForensicRun.document_id)
+        .where(PdfForensicRun.investigation_id == investigation_id)
+        .order_by(PdfForensicRun.created_at.desc(), PdfForensicRun.id.desc())
+    )).all()
+    latest_by_document = {}
+    for run, document in rows:
+        latest_by_document.setdefault(str(document.id), (run, document))
+    latest = list(latest_by_document.values())
+    pages_analyzed = sum(int((run.result.get("document") or {}).get("page_count") or 0) for run, _document in latest)
+    return {
+        "summary": {
+            "pdf_documents": len(pdf_documents),
+            "documents_analyzed": len(latest),
+            "pages_analyzed": pages_analyzed,
+            "completed": sum(run.status == "completed" for run, _document in latest),
+            "partial": sum(run.status == "partial" for run, _document in latest),
+        },
+        "documents": [{
+            "document_id": str(document.id), "filename": document.filename,
+            "source_sha256": run.source_sha256, "status": run.status,
+            "page_count": (run.result.get("document") or {}).get("page_count", 0),
+            "created_at": run.created_at.isoformat(),
+        } for run, document in latest],
+    }
+
+
+@router.get("/{investigation_id}/cross-method-correlations")
+async def cross_method_correlations(
+    investigation_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission("investigations:read")),
+):
+    await owned_investigation(db, user, investigation_id)
+    pdf_rows = (await db.scalars(select(PdfForensicRun).where(PdfForensicRun.investigation_id == investigation_id).order_by(PdfForensicRun.created_at, PdfForensicRun.id))).all()
+    visual_rows = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation_id).order_by(VisualAnalysisRun.created_at, VisualAnalysisRun.id))).all()
+    pdf_runs = [{"id": str(run.id), "document_id": str(run.document_id), "source_sha256": run.source_sha256, "result": run.result, "created_at": run.created_at.isoformat()} for run in pdf_rows]
+    visual_runs = [{"id": str(run.id), "document_id": str(run.document_id), "result": run.result, "created_at": run.created_at.isoformat()} for run in visual_rows]
+    return correlate_pdf_text_and_visual(pdf_runs, visual_runs)
+
+
+@router.get("/{investigation_id}/pdf-forensic-artifacts/{artifact_id}")
+async def get_pdf_forensic_artifact(
+    investigation_id: UUID,
+    artifact_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission("investigations:read")),
+):
+    await owned_investigation(db, user, investigation_id)
+    artifact = await db.scalar(select(PdfForensicArtifact).where(
+        PdfForensicArtifact.id == artifact_id,
+        PdfForensicArtifact.investigation_id == investigation_id,
+    ))
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="PDF forensic artifact not found")
+    run_dir = _pdf_artifact_run_dir(artifact.run_id)
+    candidate = run_dir / artifact.storage_key
+    path = candidate.resolve()
+    if candidate.is_symlink() or path.parent != run_dir or not path.is_file():
+        raise HTTPException(status_code=404, detail="PDF forensic artifact is unavailable")
+    digest = await asyncio.to_thread(_sha256_file, path)
+    if digest != artifact.sha256:
+        raise HTTPException(status_code=409, detail="Stored artifact hash does not match its recorded SHA-256")
+    await append_audit(
+        db,
+        investigation_id=investigation_id,
+        actor_user_id=user.id,
+        action="evidence.pdf_artifact_accessed",
+        target_type="pdf_forensic_artifact",
+        target_id=str(artifact.id),
+        details={"document_id": str(artifact.document_id), "object_number": artifact.object_number, "sha256": digest},
+    )
+    await db.commit()
+    return FileResponse(path, media_type=artifact.mime_type, filename=f"pdf-object-{artifact.object_number}.{artifact.mime_type.split('/')[-1]}", headers={"X-Content-SHA256": digest, "Cache-Control": "no-store"})
 
 
 @router.post("/{investigation_id}/dossiers", status_code=201)
@@ -809,8 +1223,8 @@ async def search_evidence(investigation_id: UUID, payload: SearchRequest, reques
         "citations": citations,
         "llm": {
             "used": False,
-            "status": "unavailable" if not settings.xai_api_key else "not_used",
-            "reason": "No language-model provider is configured." if not settings.xai_api_key else "Search returns stored evidence only. A model narrative is not generated for this request.",
+            "status": "unavailable" if not settings.llm_api_key else "not_used",
+            "reason": "Groq is not configured." if not settings.llm_api_key else "Search returns stored evidence only. A model narrative is not generated for this request.",
         },
         "conflicts": [ _finding_dict(item) for item in findings if item.finding_type == "identifier_amount_conflict" and needle in f"{item.title} {item.description}".casefold() ],
     }

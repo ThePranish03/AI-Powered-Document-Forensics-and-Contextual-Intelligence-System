@@ -1,0 +1,2860 @@
+diff --git a/backend/app/api/v1/analysis.py b/backend/app/api/v1/analysis.py
+index 120f10f..4a5938a 100644
+--- a/backend/app/api/v1/analysis.py
++++ b/backend/app/api/v1/analysis.py
+@@ -1,9 +1,11 @@
+ import asyncio
+ import hashlib
+ import json
++import shutil
+ from datetime import datetime, timezone
+ from pathlib import Path
+-from uuid import UUID
++from time import perf_counter
++from uuid import UUID, uuid4
+ 
+ from fastapi import APIRouter, Depends, HTTPException, Query, Request
+ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+@@ -14,11 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
+ from app.api.deps import get_db, require_csrf, require_permission
+ from app.api.v1.investigations import owned_investigation, stored_document_path
+ from app.core.config import settings
+-from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, EvidencePage, EvidenceSpan, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, TimelineEvent, User, VisualAnalysisArtifact, VisualAnalysisPage, VisualAnalysisRun, VisualCandidateRegion
++from app.models.entities import AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, EvidencePage, EvidenceSpan, ExtractionRun, Finding, OCRResult, OcrEvaluationRun, PdfForensicArtifact, PdfForensicRun, RelationshipAnalysis, TimelineEvent, User, VisualAnalysisArtifact, VisualAnalysisPage, VisualAnalysisRun, VisualCandidateRegion
+ from app.services.audit_chain import append_audit, verify_audit_chain
+ from app.services.dossier_report import render_pdf, snapshot_digest
+ from app.services.investigation_analysis import _finding_dict, _timeline_dict, create_dossier, run_investigation_analysis
++from app.services.evidence_correlation import correlate_pdf_text_and_visual
+ from app.services.ocr_metrics import build_cross_document_correlation, evaluate_samples
++from app.services.pdf_forensics import analyze_pdf_isolated, compare_pdf_native_text_to_ocr
+ from app.services.visual_forensics import analyze_file
+ from app.services.visual_forensics_engine import engine_health_payload
+ from app.services.visual_forensics_pipeline import run_engine_pipeline
+@@ -78,10 +82,36 @@ class VisualRegionReview(BaseModel):
+     review_notes: str | None = Field(default=None, max_length=4000)
+ 
+ 
++def _pdf_forensic_run_payload(run: PdfForensicRun) -> dict:
++    return {
++        "id": str(run.id),
++        "investigation_id": str(run.investigation_id),
++        "document_id": str(run.document_id),
++        "source_sha256": run.source_sha256,
++        "status": run.status,
++        "parser": {"name": run.parser_name, "version": run.parser_version},
++        "created_at": run.created_at.isoformat(),
++        "result": run.result,
++    }
++
++
++def _pdf_artifact_run_dir(run_id: UUID) -> Path:
++    root = Path(settings.document_storage_path).resolve() / "pdf_artifacts"
++    candidate = root / run_id.hex
++    if candidate.is_symlink():
++        raise HTTPException(status_code=500, detail="PDF artifact storage is unavailable")
++    target = candidate.resolve()
++    if target.parent != root.resolve():
++        raise HTTPException(status_code=500, detail="PDF artifact storage is unavailable")
++    return target
++
++
+ async def _correlation_data(db: AsyncSession, investigation_id: UUID) -> dict:
++    started = perf_counter()
+     rows = (await db.execute(
+-        select(Document, OCRResult)
++        select(Document, OCRResult, RelationshipAnalysis)
+         .outerjoin(OCRResult, OCRResult.document_id == Document.id)
++        .outerjoin(RelationshipAnalysis, RelationshipAnalysis.document_id == Document.id)
+         .where(Document.investigation_id == investigation_id)
+         .order_by(Document.created_at, Document.id)
+     )).all()
+@@ -94,8 +124,13 @@ async def _correlation_data(db: AsyncSession, investigation_id: UUID) -> dict:
+         "blocks": result.blocks if result else [],
+         "text": result.recognized_text if result else "",
+         "processing_status": document.processing_status,
+-    } for document, result in rows]
+-    payload = build_cross_document_correlation(documents)
++        "structured_extraction": structured.payload if structured else None,
++    } for document, result, structured in rows]
++    candidate_started = perf_counter()
++    payload = build_cross_document_correlation(documents, include_timings=True)
++    candidate_generation_ms = round((perf_counter() - candidate_started) * 1000, 3)
++    request_to_candidate_ms = round((perf_counter() - started) * 1000, 3)
++    relationship_timings = payload.get("timings_ms", {})
+     review_nodes = {
+         item.canonical_id: item
+         for item in (await db.scalars(select(DerivedGraphNode).where(DerivedGraphNode.investigation_id == investigation_id))).all()
+@@ -110,6 +145,20 @@ async def _correlation_data(db: AsyncSession, investigation_id: UUID) -> dict:
+     payload["summary"]["rejected_links"] = sum(link["review_status"] == "rejected" for link in payload["links"])
+     payload["summary"]["unreviewed_links"] = sum(link["review_status"] == "candidate" for link in payload["links"])
+     payload["summary"]["candidate_links"] = payload["summary"]["unreviewed_links"]
++    relationship_pending = any(document["processing_status"] in {
++        "queued", "processing", "relationship_extraction_pending", "relationship_extraction_processing",
++    } for document in documents)
++    relationship_failed = any(document["processing_status"] in {"failed", "relationship_extraction_failed"} for document in documents)
++    payload["semantic_enrichment"] = {
++        "status": "pending" if relationship_pending else "partial" if relationship_failed else "ready",
++        "description": "Exact deterministic candidates are available for review while model enrichment runs. All links remain unconfirmed candidates.",
++    }
++    payload["timings_ms"] = {
++        "cache_hit": bool(relationship_timings.get("cache_hit")),
++        "deterministic_computation": relationship_timings.get("deterministic_computation"),
++        "deterministic_candidate_generation": candidate_generation_ms,
++        "time_to_first_candidate": request_to_candidate_ms if payload["links"] else None,
++    }
+     return payload
+ 
+ 
+@@ -376,7 +425,7 @@ async def rerun_cross_document_correlation(investigation_id: UUID, request: Requ
+         action="correlation.completed",
+         target_type="investigation",
+         target_id=str(investigation.id),
+-        details={"method": "deterministic_exact_identifier_v1", "documents_considered": result["documents_considered"]},
++        details={"method": "hybrid_deterministic_exact_v2", "documents_considered": result["documents_considered"]},
+     )
+     await db.commit()
+     return await _correlation_data(db, investigation_id)
+@@ -403,7 +452,7 @@ async def review_correlation_candidate(investigation_id: UUID, canonical_id: str
+             label=link["normalized_identifier"],
+             entity_type=link["identifier_type"],
+             document_ids=link["document_ids"],
+-            resolution="identifier_match",
++            resolution="case_link_match" if link["relation_type"] == "shared_case_link" else "exact_entity_candidate" if link["relation_type"] == "shared_canonical_entity" else "identifier_match",
+             basis=link["explanation"],
+         )
+         db.add(node)
+@@ -537,6 +586,203 @@ def _sha256_file(path: Path) -> str:
+     return digest.hexdigest()
+ 
+ 
++@router.post("/{investigation_id}/documents/{document_id}/pdf-forensics", status_code=201)
++async def analyze_pdf_structure(
++    investigation_id: UUID,
++    document_id: UUID,
++    request: Request,
++    db: AsyncSession = Depends(get_db),
++    user: User = Depends(require_permission("investigations:update")),
++):
++    require_csrf(request)
++    await owned_investigation(db, user, investigation_id)
++    document = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
++    if document is None:
++        raise HTTPException(status_code=404, detail="Document not found")
++    if document.content_type != "application/pdf":
++        raise HTTPException(status_code=415, detail="PDF structural analysis is available for PDF sources")
++    if not document.sha256:
++        raise HTTPException(status_code=409, detail="Source evidence has no recorded SHA-256")
++    path = stored_document_path(document)
++    run_id = uuid4()
++    artifact_dir = _pdf_artifact_run_dir(run_id)
++    try:
++        result = await asyncio.to_thread(analyze_pdf_isolated, path, document.sha256, artifact_dir=artifact_dir)
++    except ValueError as exc:
++        shutil.rmtree(artifact_dir, ignore_errors=True)
++        detail = str(exc)
++        if "SHA-256" in detail:
++            raise HTTPException(status_code=409, detail="Stored evidence hash does not match its recorded SHA-256") from exc
++        raise HTTPException(status_code=422, detail=detail) from exc
++    except TimeoutError as exc:
++        shutil.rmtree(artifact_dir, ignore_errors=True)
++        raise HTTPException(status_code=504, detail="PDF structural analysis exceeded its process timeout") from exc
++    except Exception as exc:
++        shutil.rmtree(artifact_dir, ignore_errors=True)
++        raise HTTPException(status_code=422, detail="PDF structural analysis could not parse this source") from exc
++
++    ocr_result = await db.scalar(select(OCRResult).where(OCRResult.document_id == document.id))
++    if ocr_result and isinstance(ocr_result.blocks, list):
++        pages_by_number = {}
++        for block in ocr_result.blocks:
++            if not isinstance(block, dict) or not isinstance(block.get("page_index"), int):
++                continue
++            page_number = block["page_index"] + 1
++            geometry = block.get("page_geometry")
++            if isinstance(geometry, dict):
++                pages_by_number[page_number] = {"page_number": page_number, "width": geometry.get("render_width_px"), "height": geometry.get("render_height_px")}
++        result["text_comparison"] = compare_pdf_native_text_to_ocr(result, list(pages_by_number.values()), ocr_result.blocks)
++    else:
++        result["text_comparison"] = {"schema_version": "native_text_ocr_comparison_v1", "status": "unavailable", "method": "validated_pixel_to_pdf_bbox_overlap_and_normalized_text_comparison", "discrepancies": [], "skipped_pages": [], "limitations": ["No OCR result was available when this immutable PDF analysis run was created."]}
++
++    artifact_records = result.pop("artifacts", [])
++    run = PdfForensicRun(
++        id=run_id,
++        investigation_id=investigation_id,
++        document_id=document.id,
++        source_sha256=document.sha256,
++        status=result["status"],
++        parser_name=result["parser"]["name"],
++        parser_version=result["parser"]["version"],
++        result=result,
++        created_by_user_id=user.id,
++    )
++    db.add(run)
++    try:
++        await db.flush()
++        for artifact in artifact_records:
++            db.add(PdfForensicArtifact(
++                id=UUID(artifact["id"]), investigation_id=investigation_id,
++                document_id=document.id, run_id=run.id, object_number=artifact["object_number"],
++                source_sha256=document.sha256, storage_key=artifact["storage_key"],
++                mime_type=artifact["mime_type"], byte_size=artifact["byte_size"],
++                width_px=artifact["width_px"], height_px=artifact["height_px"], sha256=artifact["sha256"],
++            ))
++        await append_audit(
++            db,
++            investigation_id=investigation_id,
++            actor_user_id=user.id,
++            action="evidence.pdf_structure_analyzed",
++            target_type="pdf_forensic_run",
++            target_id=str(run.id),
++            details={"document_id": str(document.id), "source_sha256": document.sha256, "status": run.status, "page_count": result["document"]["page_count"], "extracted_image_count": len(artifact_records)},
++        )
++        await db.commit()
++        await db.refresh(run)
++    except Exception:
++        await db.rollback()
++        shutil.rmtree(artifact_dir, ignore_errors=True)
++        raise
++    return _pdf_forensic_run_payload(run)
++
++
++@router.get("/{investigation_id}/documents/{document_id}/pdf-forensics/latest")
++async def latest_pdf_structure(
++    investigation_id: UUID,
++    document_id: UUID,
++    db: AsyncSession = Depends(get_db),
++    user: User = Depends(require_permission("investigations:read")),
++):
++    await owned_investigation(db, user, investigation_id)
++    document = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
++    if document is None:
++        raise HTTPException(status_code=404, detail="Document not found")
++    run = await db.scalar(
++        select(PdfForensicRun)
++        .where(PdfForensicRun.document_id == document.id, PdfForensicRun.investigation_id == investigation_id)
++        .order_by(PdfForensicRun.created_at.desc(), PdfForensicRun.id.desc())
++    )
++    return {"item": _pdf_forensic_run_payload(run) if run else None}
++
++
++@router.get("/{investigation_id}/pdf-forensics/summary")
++async def pdf_structure_summary(
++    investigation_id: UUID,
++    db: AsyncSession = Depends(get_db),
++    user: User = Depends(require_permission("investigations:read")),
++):
++    await owned_investigation(db, user, investigation_id)
++    pdf_documents = (await db.scalars(select(Document).where(
++        Document.investigation_id == investigation_id,
++        Document.content_type == "application/pdf",
++    ))).all()
++    rows = (await db.execute(
++        select(PdfForensicRun, Document)
++        .join(Document, Document.id == PdfForensicRun.document_id)
++        .where(PdfForensicRun.investigation_id == investigation_id)
++        .order_by(PdfForensicRun.created_at.desc(), PdfForensicRun.id.desc())
++    )).all()
++    latest_by_document = {}
++    for run, document in rows:
++        latest_by_document.setdefault(str(document.id), (run, document))
++    latest = list(latest_by_document.values())
++    pages_analyzed = sum(int((run.result.get("document") or {}).get("page_count") or 0) for run, _document in latest)
++    return {
++        "summary": {
++            "pdf_documents": len(pdf_documents),
++            "documents_analyzed": len(latest),
++            "pages_analyzed": pages_analyzed,
++            "completed": sum(run.status == "completed" for run, _document in latest),
++            "partial": sum(run.status == "partial" for run, _document in latest),
++        },
++        "documents": [{
++            "document_id": str(document.id), "filename": document.filename,
++            "source_sha256": run.source_sha256, "status": run.status,
++            "page_count": (run.result.get("document") or {}).get("page_count", 0),
++            "created_at": run.created_at.isoformat(),
++        } for run, document in latest],
++    }
++
++
++@router.get("/{investigation_id}/cross-method-correlations")
++async def cross_method_correlations(
++    investigation_id: UUID,
++    db: AsyncSession = Depends(get_db),
++    user: User = Depends(require_permission("investigations:read")),
++):
++    await owned_investigation(db, user, investigation_id)
++    pdf_rows = (await db.scalars(select(PdfForensicRun).where(PdfForensicRun.investigation_id == investigation_id).order_by(PdfForensicRun.created_at, PdfForensicRun.id))).all()
++    visual_rows = (await db.scalars(select(VisualAnalysisRun).where(VisualAnalysisRun.investigation_id == investigation_id).order_by(VisualAnalysisRun.created_at, VisualAnalysisRun.id))).all()
++    pdf_runs = [{"id": str(run.id), "document_id": str(run.document_id), "source_sha256": run.source_sha256, "result": run.result, "created_at": run.created_at.isoformat()} for run in pdf_rows]
++    visual_runs = [{"id": str(run.id), "document_id": str(run.document_id), "result": run.result, "created_at": run.created_at.isoformat()} for run in visual_rows]
++    return correlate_pdf_text_and_visual(pdf_runs, visual_runs)
++
++
++@router.get("/{investigation_id}/pdf-forensic-artifacts/{artifact_id}")
++async def get_pdf_forensic_artifact(
++    investigation_id: UUID,
++    artifact_id: UUID,
++    db: AsyncSession = Depends(get_db),
++    user: User = Depends(require_permission("investigations:read")),
++):
++    await owned_investigation(db, user, investigation_id)
++    artifact = await db.scalar(select(PdfForensicArtifact).where(
++        PdfForensicArtifact.id == artifact_id,
++        PdfForensicArtifact.investigation_id == investigation_id,
++    ))
++    if artifact is None:
++        raise HTTPException(status_code=404, detail="PDF forensic artifact not found")
++    run_dir = _pdf_artifact_run_dir(artifact.run_id)
++    candidate = run_dir / artifact.storage_key
++    path = candidate.resolve()
++    if candidate.is_symlink() or path.parent != run_dir or not path.is_file():
++        raise HTTPException(status_code=404, detail="PDF forensic artifact is unavailable")
++    digest = await asyncio.to_thread(_sha256_file, path)
++    if digest != artifact.sha256:
++        raise HTTPException(status_code=409, detail="Stored artifact hash does not match its recorded SHA-256")
++    await append_audit(
++        db,
++        investigation_id=investigation_id,
++        actor_user_id=user.id,
++        action="evidence.pdf_artifact_accessed",
++        target_type="pdf_forensic_artifact",
++        target_id=str(artifact.id),
++        details={"document_id": str(artifact.document_id), "object_number": artifact.object_number, "sha256": digest},
++    )
++    await db.commit()
++    return FileResponse(path, media_type=artifact.mime_type, filename=f"pdf-object-{artifact.object_number}.{artifact.mime_type.split('/')[-1]}", headers={"X-Content-SHA256": digest, "Cache-Control": "no-store"})
++
++
+ @router.post("/{investigation_id}/dossiers", status_code=201)
+ async def generate_dossier(investigation_id: UUID, request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:update"))):
+     require_csrf(request)
+@@ -809,8 +1055,8 @@ async def search_evidence(investigation_id: UUID, payload: SearchRequest, reques
+         "citations": citations,
+         "llm": {
+             "used": False,
+-            "status": "unavailable" if not settings.xai_api_key else "not_used",
+-            "reason": "No language-model provider is configured." if not settings.xai_api_key else "Search returns stored evidence only. A model narrative is not generated for this request.",
++            "status": "unavailable" if not settings.llm_api_key else "not_used",
++            "reason": "No language-model provider is configured." if not settings.llm_api_key else "Search returns stored evidence only. A model narrative is not generated for this request.",
+         },
+         "conflicts": [ _finding_dict(item) for item in findings if item.finding_type == "identifier_amount_conflict" and needle in f"{item.title} {item.description}".casefold() ],
+     }
+diff --git a/backend/app/api/v1/investigations.py b/backend/app/api/v1/investigations.py
+index 53e9187..d1da5f5 100644
+--- a/backend/app/api/v1/investigations.py
++++ b/backend/app/api/v1/investigations.py
+@@ -42,6 +42,25 @@ def stored_document_path(doc: Document, *, require_exists: bool = True) -> Path:
+     return path
+ 
+ 
++def _document_analysis_stages(document: Document, payload: object) -> dict[str, str]:
++    record = payload if isinstance(payload, dict) else {}
++    stored = record.get("analysis_stages") if isinstance(record.get("analysis_stages"), dict) else {}
++    deterministic = record.get("deterministic_analysis") if isinstance(record.get("deterministic_analysis"), dict) else {}
++    terminal = document.processing_status
++    deterministic_status = stored.get("deterministic_evidence") or deterministic.get("status")
++    correlation_status = stored.get("investigation_correlation") or deterministic.get("correlation_status")
++    ai_status = stored.get("ai_enrichment")
++    if ai_status is None:
++        ai_status = "completed" if terminal == "relationship_extraction_completed" else "failed" if terminal == "relationship_extraction_failed" else "pending"
++    return {
++        "source_extraction": stored.get("source_extraction", "completed" if terminal not in {"queued", "processing", "failed"} else "pending"),
++        "deterministic_evidence": deterministic_status or "pending",
++        "investigation_correlation": correlation_status or "pending",
++        "ai_enrichment": ai_status,
++        "investigator_review": stored.get("investigator_review", "pending"),
++    }
++
++
+ async def owned_investigation(db: AsyncSession, user: User, investigation_id: UUID) -> Investigation:
+     investigation = await db.scalar(select(Investigation).where(
+         Investigation.id == investigation_id,
+@@ -157,15 +176,26 @@ async def update_investigation(investigation_id: UUID, payload: InvestigationPat
+ @router.get("/{investigation_id}/documents", response_model=list[DocumentResponse])
+ async def list_documents(investigation_id: UUID, db: AsyncSession = Depends(get_db), user: User = Depends(require_permission("investigations:read"))):
+     await owned_investigation(db, user, investigation_id)
+-    documents = (await db.scalars(select(Document).where(Document.investigation_id == investigation_id).order_by(Document.created_at.desc()))).all()
++    rows = (await db.execute(
++        select(Document, RelationshipAnalysis)
++        .outerjoin(RelationshipAnalysis, RelationshipAnalysis.document_id == Document.id)
++        .where(Document.investigation_id == investigation_id)
++        .order_by(Document.created_at.desc())
++    )).all()
+     return [{
+         "id": str(doc.id), "filename": doc.filename, "content_type": doc.content_type,
+         "source_description": doc.source_description,
+         "uploaded_by_user_id": str(doc.uploaded_by_user_id) if doc.uploaded_by_user_id else None,
+         "size_bytes": doc.size_bytes, "processing_status": doc.processing_status,
+-        "attempts_remaining": max(0, 3 - doc.processing_attempts), "created_at": doc.created_at,
++        "attempts_remaining": max(0, 3 - (doc.relationship_extraction_attempts if doc.processing_status == "relationship_extraction_failed" else doc.processing_attempts)),
++        "processing_error": doc.processing_error,
++        "processing_error_code": doc.processing_error_code,
++        "processing_error_retryable": doc.processing_error_retryable,
++        "analysis_stages": _document_analysis_stages(doc, relationship.payload if relationship else None),
++        "relationship_extraction_attempts": doc.relationship_extraction_attempts,
++        "created_at": doc.created_at,
+         "sha256": doc.sha256,
+-    } for doc in documents]
++    } for doc, relationship in rows]
+ 
+ 
+ @router.post("/{investigation_id}/documents", status_code=201)
+@@ -236,8 +266,16 @@ async def document_status(investigation_id: UUID, document_id: UUID, db: AsyncSe
+     doc = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
+     if doc is None:
+         raise HTTPException(status_code=404, detail="Document not found")
++    relationship = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc.id))
+     failed = doc.processing_status in {"failed", "relationship_extraction_failed"}
+-    return {"id": str(doc.id), "status": doc.processing_status, "error": doc.processing_error if failed else None}
++    return {
++        "id": str(doc.id), "status": doc.processing_status,
++        "error": doc.processing_error if failed else None,
++        "error_code": doc.processing_error_code if failed else None,
++        "retryable": doc.processing_error_retryable if failed else None,
++        "analysis_stages": _document_analysis_stages(doc, relationship.payload if relationship else None),
++        "attempts_remaining": max(0, 3 - (doc.relationship_extraction_attempts if doc.processing_status == "relationship_extraction_failed" else doc.processing_attempts)),
++    }
+ 
+ 
+ @router.get("/{investigation_id}/documents/{document_id}")
+@@ -249,6 +287,7 @@ async def document_details(investigation_id: UUID, document_id: UUID, db: AsyncS
+     latest_run = await db.scalar(
+         select(ExtractionRun).where(ExtractionRun.document_id == doc.id).order_by(ExtractionRun.run_number.desc()).limit(1)
+     )
++    relationship = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc.id))
+     return {
+         "id": str(doc.id),
+         "investigation_id": str(doc.investigation_id),
+@@ -259,8 +298,12 @@ async def document_details(investigation_id: UUID, document_id: UUID, db: AsyncS
+         "size_bytes": doc.size_bytes,
+         "sha256": doc.sha256,
+         "processing_status": doc.processing_status,
++        "analysis_stages": _document_analysis_stages(doc, relationship.payload if relationship else None),
+         "processing_error": doc.processing_error,
++        "processing_error_code": doc.processing_error_code,
++        "processing_error_retryable": doc.processing_error_retryable,
+         "processing_attempts": doc.processing_attempts,
++        "relationship_extraction_attempts": doc.relationship_extraction_attempts,
+         "created_at": doc.created_at.isoformat(),
+         "processing_started_at": doc.processing_started_at.isoformat() if doc.processing_started_at else None,
+         "processing_completed_at": doc.processing_completed_at.isoformat() if doc.processing_completed_at else None,
+@@ -384,6 +427,9 @@ async def get_extraction_run(investigation_id: UUID, document_id: UUID, run_id:
+             "text": span.text,
+             "bounding_box": span.bounding_box,
+             "confidence": span.confidence,
++            "extraction_method": span.extraction_method,
++            "coordinate_space": span.coordinate_space,
++            "source_sha256": span.source_sha256,
+             "source_reference": span.source_reference,
+         } for span in spans],
+     }
+@@ -398,8 +444,10 @@ async def document_ocr(investigation_id: UUID, document_id: UUID, include_raw: b
+     result = await db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
+     if result is None:
+         raise HTTPException(status_code=409, detail="OCR output is not available yet")
++    raw_result = result.raw_result if isinstance(result.raw_result, dict) else {}
+     data = {"document_id": str(document_id), "provider": result.provider, "provider_version": result.provider_version,
+-            "recognized_text": result.recognized_text, "blocks": result.blocks}
++            "recognized_text": result.recognized_text, "blocks": result.blocks,
++            "extraction_coverage": raw_result.get("extraction_coverage", {"status": "unavailable", "reason": "No page-level coverage data was recorded for this extraction run."})}
+     if include_raw:
+         data["raw_result"] = result.raw_result
+     return data
+@@ -412,14 +460,23 @@ async def retry_document(investigation_id: UUID, document_id: UUID, request: Req
+     doc = await db.scalar(select(Document).where(Document.id == document_id, Document.investigation_id == investigation_id))
+     if doc is None:
+         raise HTTPException(status_code=404, detail="Document not found")
+-    if doc.processing_status not in {"failed", "relationship_extraction_failed"} or doc.processing_attempts >= 3:
++    if doc.processing_status not in {"failed", "relationship_extraction_failed"}:
++        raise HTTPException(status_code=409, detail="This document cannot be retried")
++    relation_only = doc.processing_status == "relationship_extraction_failed"
++    attempts = doc.relationship_extraction_attempts if relation_only else doc.processing_attempts
++    if attempts >= 3 or doc.processing_error_retryable is False:
+         raise HTTPException(status_code=409, detail="This document cannot be retried")
+-    doc.processing_status = "queued"
++    has_ocr = await db.scalar(select(OCRResult.id).where(OCRResult.document_id == doc.id)) is not None
++    if relation_only and not has_ocr:
++        raise HTTPException(status_code=409, detail="Stored OCR evidence is unavailable; relationship-only retry is not possible")
++    doc.processing_status = "relationship_extraction_pending" if relation_only else "queued"
+     doc.processing_error = None
++    doc.processing_error_code = None
++    doc.processing_error_retryable = None
+     doc.processing_started_at = None
+     doc.processing_completed_at = None
+     await db.commit()
+-    return {"id": str(document_id), "status": "queued", "attempts_remaining": 3 - doc.processing_attempts}
++    return {"id": str(document_id), "status": doc.processing_status, "attempts_remaining": max(0, 3 - attempts)}
+ 
+ 
+ @router.get("/{investigation_id}/relationships/graph")
+diff --git a/backend/app/models/entities.py b/backend/app/models/entities.py
+index 30f1f68..7bb16f1 100644
+--- a/backend/app/models/entities.py
++++ b/backend/app/models/entities.py
+@@ -91,6 +91,9 @@ class Document(Base):
+     storage_key: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True, default=lambda: uuid.uuid4().hex)
+     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
++    processing_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
++    processing_error_retryable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
++    relationship_extraction_attempts: Mapped[int] = mapped_column(Integer, default=0)
+     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+     processing_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+@@ -154,6 +157,9 @@ class EvidenceSpan(Base):
+     text: Mapped[str] = mapped_column(Text)
+     bounding_box: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+     confidence: Mapped[float | None] = mapped_column(nullable=True)
++    extraction_method: Mapped[str] = mapped_column(String(32), default="ocr")
++    coordinate_space: Mapped[str | None] = mapped_column(String(32), nullable=True)
++    source_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+     source_reference: Mapped[str] = mapped_column(String(512))
+     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+ 
+@@ -303,6 +309,41 @@ class VisualCandidateRegion(Base):
+     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+ 
+ 
++class PdfForensicRun(Base):
++    """Immutable structural-analysis snapshot bound to the original evidence hash."""
++    __tablename__ = "pdf_forensic_runs"
++    __table_args__ = (Index("ix_pdf_forensic_runs_document_created", "document_id", "created_at"),)
++    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
++    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
++    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
++    source_sha256: Mapped[str] = mapped_column(String(64))
++    status: Mapped[str] = mapped_column(String(24))
++    parser_name: Mapped[str] = mapped_column(String(64))
++    parser_version: Mapped[str] = mapped_column(String(32))
++    result: Mapped[dict] = mapped_column(JSON)
++    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
++    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
++
++
++class PdfForensicArtifact(Base):
++    """Private, independently hashed object extracted from a PDF source."""
++    __tablename__ = "pdf_forensic_artifacts"
++    __table_args__ = (Index("ix_pdf_forensic_artifacts_run_object", "run_id", "object_number"),)
++    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
++    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
++    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
++    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("pdf_forensic_runs.id", ondelete="CASCADE"), index=True)
++    object_number: Mapped[int] = mapped_column(Integer)
++    source_sha256: Mapped[str] = mapped_column(String(64))
++    storage_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
++    mime_type: Mapped[str] = mapped_column(String(64))
++    byte_size: Mapped[int] = mapped_column(Integer)
++    width_px: Mapped[int] = mapped_column(Integer)
++    height_px: Mapped[int] = mapped_column(Integer)
++    sha256: Mapped[str] = mapped_column(String(64))
++    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
++
++
+ class TimelineEvent(Base):
+     __tablename__ = "timeline_events"
+     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+diff --git a/backend/app/schemas/investigation.py b/backend/app/schemas/investigation.py
+index 42ee962..577662f 100644
+--- a/backend/app/schemas/investigation.py
++++ b/backend/app/schemas/investigation.py
+@@ -43,5 +43,10 @@ class DocumentResponse(BaseModel):
+     size_bytes: int
+     processing_status: str
+     attempts_remaining: int = 3
++    processing_error: str | None = None
++    processing_error_code: str | None = None
++    processing_error_retryable: bool | None = None
++    analysis_stages: dict[str, str] = Field(default_factory=dict)
++    relationship_extraction_attempts: int = 0
+     created_at: datetime
+     sha256: str | None = None
+diff --git a/backend/app/services/ocr_metrics.py b/backend/app/services/ocr_metrics.py
+index e752df6..5d162f0 100644
+--- a/backend/app/services/ocr_metrics.py
++++ b/backend/app/services/ocr_metrics.py
+@@ -5,12 +5,20 @@ error rates are computed only when a non-empty ground-truth reference is supplie
+ """
+ from __future__ import annotations
+ 
++import copy
+ from datetime import date
+ from decimal import Decimal, InvalidOperation
++import hashlib
++import json
+ import math
+ import re
++import threading
++import time
++from collections import OrderedDict
+ from typing import Any
+ 
++from app.services.deterministic_relationships import build_deterministic_relationship_candidates
++
+ 
+ def _edits(reference: list[str], hypothesis: list[str]) -> int:
+     if not reference:
+@@ -248,6 +256,7 @@ _CURRENCY = r"(?:INR|USD|EUR|Rs\.?|₹|\$|€|[^\w\s0-9.,-]+)?\s*"
+ _LABELS = (
+     ("subtotal", re.compile(rf"(?i)\bsub[\s-]*total\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+     ("tax", re.compile(rf"(?i)(?<![A-Za-z])(?:tax|gst|vat)\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
++    ("transaction_amount", re.compile(rf"(?i)\bamount(?:\s*\([^)]*\))?\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+     ("total", re.compile(rf"(?i)\b(?:grand\s+total|total\s+amount|amount\s+due|total)\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+     ("purchase_order_value", re.compile(rf"(?i)\b(?:approved\s+)?purchase\s+order\s+value\b\s*(?:is\s*)?[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+     ("invoice_amount", re.compile(rf"(?i)\binvoice\s+(?:amount|of)\b\s*[:\-]?\s*{_CURRENCY}{_AMOUNT}")),
+@@ -256,7 +265,12 @@ _LABELS = (
+ )
+ _IDENTIFIER = re.compile(r"(?i)\b(?P<label>purchase\s*order|invoice|transaction|reference|account|vendor)(?![a-z])(?:\s*(?:no|number|id|#))?\s*[:#\-]?\s*(?P<value>[A-Z0-9][A-Z0-9\-]{2,})")
+ _PREFIXED_IDENTIFIER = re.compile(r"(?i)\b(?P<prefix>INV|PO|TXN|REF)-(?P<suffix>[A-Z0-9][A-Z0-9\-]{2,})\b")
+-_IDENTIFIER_STOP_WORDS = {"total", "subtotal", "approval", "value", "should", "reference", "holder", "matching", "amount", "invoice", "order", "date", "ledger"}
++_IDENTIFIER_STOP_WORDS = {"total", "subtotal", "approval", "value", "should", "reference", "holder", "matching", "amount", "invoice", "order", "date", "ledger", "code", "onboarding", "master", "form"}
++_DOCUMENT_ID_FIELD = re.compile(r"(?i)\bDocument\s+ID\s*[:#]\s*([A-Z0-9][A-Z0-9-]{2,})")
++_CASE_LINK_FIELD = re.compile(r"(?i)\bCase\s+Link\s*[:#]\s*([A-Z0-9][A-Z0-9-]{2,})")
++_VENDOR_IDENTIFIER = re.compile(r"(?i)\bVND-[A-Z0-9][A-Z0-9-]*\b")
++_VESSEL_IDENTIFIER = re.compile(r"(?i)\b(?:Vessel\s+)?IMO\s*[:#]?\s*(\d{7})\b")
++_ACCOUNT_NUMBER = re.compile(r"(?i)\b(?:corporate\s+bank\s+account|bank\s+account|beneficiary\s+account|account)\b[^\n]{0,120}?#\s*([A-Z0-9][A-Z0-9-]{3,})")
+ _ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+ _SLASH_DATE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+ _MONTH_DATE = re.compile(r"(?i)\b(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?P<year>\d{4})(?!\d)")
+@@ -306,13 +320,100 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
+     labeled: dict[str, dict[str, Any]] = {}
+     financial_amounts: list[dict[str, Any]] = []
+     observed_fields: list[dict[str, Any]] = []
++    structured_fields: list[dict[str, Any]] = []
++    table_rows: list[dict[str, Any]] = []
++    transaction_rows: list[dict[str, Any]] = []
++    ownership_rows: list[dict[str, Any]] = []
++    access_session_rows: list[dict[str, Any]] = []
+     seen_identifiers: set[tuple[str, str]] = set()
++    seen_observation_text: set[str] = set()
+     for block in blocks:
+         text = str(block.get("text") or "")
+-        if text:
+-            pieces.append(text)
++        if not text:
++            continue
++        logical_text = " ".join(text.casefold().split())
++        if logical_text in seen_observation_text:
++            continue
++        seen_observation_text.add(logical_text)
++        pieces.append(text)
+         block_id = block.get("block_id")
+         page = block.get("page_index")
++        cells = block.get("cells")
++        if isinstance(cells, list):
++            row = {}
++            row_cells = []
++            for cell in cells:
++                if not isinstance(cell, dict):
++                    continue
++                header = " ".join(str(cell.get("header") or "").casefold().split())
++                raw_value = " ".join(str(cell.get("raw_text") or "").split())
++                if not raw_value:
++                    continue
++                normalized_value = raw_value
++                if header in {"beneficiary account", "account", "source ip", "ip address", "session id", "transaction id", "tx id", "vendor id", "vessel imo"}:
++                    normalized_value = re.sub(r"\s*-\s*", "-", raw_value).upper()
++                elif "@" in raw_value:
++                    normalized_value = re.sub(r"\s*-\s*", "-", re.sub(r"\s+", "", raw_value)).casefold()
++                row_cells.append({
++                    "column_index": cell.get("column_index"),
++                    "header": cell.get("header"),
++                    "raw": raw_value,
++                    "normalized": normalized_value,
++                    "bbox": cell.get("bbox"),
++                })
++                if header:
++                    row[header] = {"raw": raw_value, "normalized": normalized_value}
++                identifier_types = {
++                    "tx id": "TRANSACTION", "transaction id": "TRANSACTION", "vendor id": "VENDOR",
++                    "session id": "SESSION", "vessel imo": "VESSEL", "beneficiary account": "ACCOUNT",
++                    "account": "ACCOUNT", "source ip": "IP", "ip address": "IP",
++                }
++                entity_type = identifier_types.get(header)
++                if entity_type:
++                    value = normalized_value
++                    key = (entity_type, value)
++                    if key not in seen_identifiers:
++                        seen_identifiers.add(key)
++                        identifiers.append({"value": value, "entity_type": entity_type, "block_id": block_id, "page_index": page, "text": text})
++                structured_fields.append({
++                    "field_type": header.replace(" ", "_") or "table_column",
++                    "raw": raw_value,
++                    "normalized": normalized_value,
++                    "block_id": block_id,
++                    "page_index": page,
++                    "text": text,
++                    "table_index": block.get("table_index"),
++                    "row_index": block.get("row_index"),
++                    "column_index": cell.get("column_index"),
++                    "table_structure_status": block.get("table_structure_status", "uncertain"),
++                })
++            table_rows.append({
++                "block_id": block_id,
++                "page_index": page,
++                "table_index": block.get("table_index"),
++                "row_index": block.get("row_index"),
++                "structure_status": block.get("table_structure_status", "uncertain"),
++                "cells": row_cells,
++            })
++            if "tx id" in row:
++                transaction_rows.append({"fields": row, "block_id": block_id, "page_index": page})
++            if "full name" in row:
++                ownership_rows.append({"fields": row, "block_id": block_id, "page_index": page})
++            if "session id" in row:
++                access_session_rows.append({"fields": row, "block_id": block_id, "page_index": page})
++        for field_type, pattern in (("document_id", _DOCUMENT_ID_FIELD), ("case_link", _CASE_LINK_FIELD)):
++            match = pattern.search(text)
++            if match:
++                value = match.group(1).upper()
++                identifier_type = "DOCUMENT_ID" if field_type == "document_id" else "CASE_LINK"
++                structured_fields.append({
++                    "field_type": field_type, "raw": match.group(1), "normalized": value,
++                    "block_id": block_id, "page_index": page, "text": text,
++                })
++                key = (identifier_type, value)
++                if key not in seen_identifiers:
++                    seen_identifiers.add(key)
++                    identifiers.append({"value": value, "entity_type": identifier_type, "block_id": block_id, "page_index": page, "text": text})
+         for label, pattern in _LABELS:
+             match = pattern.search(text)
+             if match:
+@@ -347,9 +448,11 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
+             label = re.sub(r"\s+", " ", match.group("label").casefold())
+             entity_type = ("INVOICE" if label in {"invoice", "inv"} else
+                            "PURCHASE_ORDER" if label in {"purchase order", "po"} else
+-                           "TRANSACTION" if label in {"transaction", "txn"} else
++                           "TRANSACTION" if label in {"transaction", "txn", "tx", "tx id"} else
+                            "ACCOUNT" if label == "account" else
+                            "VENDOR" if label == "vendor" else "REFERENCE")
++            if entity_type == "ACCOUNT" and not re.search(r"\d", value):
++                continue
+             key = (entity_type, value)
+             if key in seen_identifiers:
+                 continue
+@@ -358,12 +461,29 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
+         for match in _PREFIXED_IDENTIFIER.finditer(text):
+             prefix = match.group("prefix").upper()
+             value = f"{prefix}-{match.group('suffix').upper()}"
++            if any(item["value"] == value and item["entity_type"] in {"CASE_LINK", "DOCUMENT_ID"} for item in identifiers):
++                continue
+             entity_type = {"INV": "INVOICE", "PO": "PURCHASE_ORDER", "TXN": "TRANSACTION", "REF": "REFERENCE"}[prefix]
+             key = (entity_type, value)
+             if key in seen_identifiers:
+                 continue
+             seen_identifiers.add(key)
+             identifiers.append({"value": value, "entity_type": entity_type, "block_id": block_id, "page_index": page, "text": text})
++        for entity_type, pattern in (("VENDOR", _VENDOR_IDENTIFIER), ("VESSEL", _VESSEL_IDENTIFIER)):
++            for match in pattern.finditer(text):
++                raw_value = match.group(0) if entity_type == "VENDOR" else match.group(1)
++                value = raw_value.upper()
++                key = (entity_type, value)
++                if key in seen_identifiers:
++                    continue
++                seen_identifiers.add(key)
++                identifiers.append({"value": value, "entity_type": entity_type, "block_id": block_id, "page_index": page, "text": text})
++        for match in _ACCOUNT_NUMBER.finditer(text):
++            value = re.sub(r"\s*-\s*", "-", match.group(1)).upper()
++            key = ("ACCOUNT", value)
++            if key not in seen_identifiers:
++                seen_identifiers.add(key)
++                identifiers.append({"value": value, "entity_type": "ACCOUNT", "block_id": block_id, "page_index": page, "text": text})
+         for match in _ISO_DATE.finditer(text):
+             year, month, day = (int(match.group(i)) for i in (1, 2, 3))
+             if _valid_date(year, month, day):
+@@ -392,15 +512,22 @@ def extract_document_facts(document: dict) -> dict[str, Any]:
+         "sha256": document.get("sha256"),
+         "provider": document.get("provider"),
+         "provider_version": document.get("provider_version"),
++        "processing_status": document.get("processing_status"),
+         "text": text,
+         "identifiers": identifiers,
+         "labeled_amounts": labeled,
+         "financial_amounts": financial_amounts,
+         "observed_fields": observed_fields,
++        "structured_fields": structured_fields,
++        "table_rows": table_rows,
++        "transaction_rows": transaction_rows,
++        "ownership_rows": ownership_rows,
++        "access_session_rows": access_session_rows,
+         "dates": dates,
+         "quality": quality,
+         "structured_entities": (document.get("structured_extraction") or {}).get("entities", []),
+         "structured_relationships": (document.get("structured_extraction") or {}).get("relationships", []),
++        "source_blocks": blocks,
+         "empty": not text.strip(),
+     }
+ 
+@@ -424,9 +551,17 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+         finding_counts[kind] = finding_counts.get(kind, 0) + 1
+ 
+     def rule(rule_id: str, description: str, inspected: list[str], matched: int, comparisons: list[dict], skipped: list[dict]) -> dict[str, Any]:
++        status = "matched" if matched else "not_matched" if comparisons else (
++            "error" if any(item.get("status") == "error" for item in skipped) else
++            "extraction_incomplete" if any(item.get("status") == "extraction_incomplete" for item in skipped) else
++            "missing_input" if any(item.get("status") == "missing_input" for item in skipped) else
++            "not_matched" if any(item.get("status") == "not_matched" for item in skipped) else
++            "not_applicable"
++        )
+         return {
+             "rule_id": rule_id,
+             "description": description,
++            "status": status,
+             "executed": True,
+             "documents_inspected": inspected,
+             "fields_extracted": [],
+@@ -443,10 +578,22 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+         required = ("subtotal", "tax", "total")
+         missing = [label for label in required if label not in amounts]
+         if missing:
++            extraction_failed_without_ocr = (
++                fact.get("processing_status") == "failed"
++                and not fact.get("provider")
++                and not fact.get("source_blocks")
++                and not fact.get("text")
++            )
++            skip_status = (
++                "error" if extraction_failed_without_ocr else
++                "not_applicable" if not amounts and fact.get("text") else
++                "missing_input"
++            )
+             reconciliation_skipped.append({
+                 "document_id": fact["document_id"],
+                 "reason": "required_labeled_amounts_missing",
+                 "missing_fields": missing,
++                "status": skip_status,
+             })
+         else:
+             expected = amounts["subtotal"]["value"] + amounts["tax"]["value"]
+@@ -461,7 +608,7 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+             })
+ 
+     extraction_skipped = [
+-        {"document_id": fact["document_id"], "reason": "recognized_text_present"}
++        {"document_id": fact["document_id"], "reason": "recognized_text_present", "status": "not_matched"}
+         for fact in facts if not (fact["empty"] and fact.get("provider"))
+     ]
+     confidence_skipped = []
+@@ -469,9 +616,9 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+     for fact in facts:
+         quality = fact["quality"]
+         if quality["status"] != "computed":
+-            confidence_skipped.append({"document_id": fact["document_id"], "reason": "engine_confidence_unavailable"})
++            confidence_skipped.append({"document_id": fact["document_id"], "reason": "engine_confidence_unavailable", "status": "missing_input"})
+         elif not quality["low_confidence_block_ids"]:
+-            confidence_skipped.append({"document_id": fact["document_id"], "reason": "no_block_below_threshold", "threshold": quality["threshold"]})
++            confidence_skipped.append({"document_id": fact["document_id"], "reason": "no_block_below_threshold", "threshold": quality["threshold"], "status": "not_matched"})
+         else:
+             confidence_comparisons.append({
+                 "document_id": fact["document_id"],
+@@ -490,10 +637,10 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+         if len(group) > 1:
+             duplicate_comparisons.append(comparison)
+         else:
+-            duplicate_skipped.append({"document_id": group[0]["document_id"], "reason": "no_other_document_has_same_sha256"})
++            duplicate_skipped.append({"document_id": group[0]["document_id"], "reason": "no_other_document_has_same_sha256", "status": "not_matched"})
+     docs_with_hash = {fact["document_id"] for fact in facts if fact["sha256"]}
+     duplicate_skipped.extend(
+-        {"document_id": fact["document_id"], "reason": "sha256_unavailable"}
++        {"document_id": fact["document_id"], "reason": "sha256_unavailable", "status": "missing_input"}
+         for fact in facts if fact["document_id"] not in docs_with_hash
+     )
+ 
+@@ -511,6 +658,7 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+                 "identifier": value,
+                 "document_ids": list(distinct_docs),
+                 "reason": "identifier_type_not_used_to_compare_transaction_totals",
++                "status": "not_applicable",
+             })
+             continue
+         available = []
+@@ -537,6 +685,7 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+                 "document_ids": list(distinct_docs),
+                 "reason": "fewer_than_two_documents_have_labeled_totals",
+                 "documents_without_total": missing_total_docs,
++                "status": "missing_input",
+             })
+             continue
+         normalized_values = sorted({round(item["normalized"], 2) for item in available})
+@@ -554,12 +703,27 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+                 "identifier": value,
+                 "document_ids": [item["document_id"] for item in available],
+                 "reason": "labeled_totals_equal",
++                "status": "not_matched",
+             })
+ 
+     date_skipped = [
+-        {"document_id": fact["document_id"], "reason": "no_supported_date_string"}
++        {"document_id": fact["document_id"], "reason": "no_supported_date_string", "status": "extraction_incomplete" if not fact.get("text") else "missing_input"}
+         for fact in facts if not fact["dates"]
+     ]
++    shared_ip_comparisons = []
++    shared_ip_skipped = []
++    for fact in facts:
++        ip_users: dict[str, set[str]] = {}
++        for session in fact.get("access_session_rows", []):
++            fields = session.get("fields", {})
++            ip = fields.get("source ip", {}).get("normalized")
++            account = fields.get("user account", {}).get("normalized")
++            if ip and account:
++                ip_users.setdefault(ip, set()).add(account)
++        if not ip_users:
++            shared_ip_skipped.append({"document_id": fact["document_id"], "reason": "access_session_table_missing", "status": "missing_input"})
++        for ip, users in ip_users.items():
++            shared_ip_comparisons.append({"document_id": fact["document_id"], "ip_address": ip, "distinct_user_accounts": sorted(users), "matched": len(users) > 1})
+     diagnostic_rules = [
+         rule("subtotal_plus_tax_vs_total", "Requires subtotal, tax, and total from the same document; flags an absolute difference greater than 0.02.", inspected, finding_counts.get("reconciliation", 0), reconciliation_comparisons, reconciliation_skipped),
+         rule("empty_ocr_text", "Requires an OCR provider and empty recognized text.", inspected, finding_counts.get("extraction_gap", 0), [], extraction_skipped),
+@@ -567,6 +731,7 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+         rule("duplicate_file_bytes", "Requires the same recorded SHA-256 on at least two documents.", inspected, finding_counts.get("duplicate_bytes", 0), duplicate_comparisons, duplicate_skipped),
+         rule("shared_identifier_total_conflict", "Requires the same typed identifier in at least two documents, at least two parsed labeled totals, and unequal normalized values.", inspected, finding_counts.get("identifier_amount_conflict", 0), cross_comparisons, cross_skipped),
+         rule("date_extraction", "Extracts valid ISO, slash-form, and named-month dates into timeline events; this rule does not create findings.", inspected, len(timeline), [], date_skipped),
++        rule("shared_access_ip_accounts", "Surfaces an IP address used by at least two distinct user accounts in a source access log; shared gateways are a possible explanation.", inspected, finding_counts.get("shared_access_ip", 0), shared_ip_comparisons, shared_ip_skipped),
+     ]
+     diagnostic_fields = {
+         "subtotal_plus_tax_vs_total": lambda fact: [item for item in fact["financial_amounts"] if item["field_type"] in {"subtotal", "tax", "total"}],
+@@ -575,6 +740,7 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+         "duplicate_file_bytes": lambda fact: [{"sha256": fact.get("sha256")}],
+         "shared_identifier_total_conflict": lambda fact: [{"identifiers": fact["identifiers"], "labeled_total": fact["labeled_amounts"].get("total")}],
+         "date_extraction": lambda fact: fact["dates"],
++        "shared_access_ip_accounts": lambda fact: fact["access_session_rows"],
+     }
+     for item in diagnostic_rules:
+         item["fields_extracted"] = [{
+@@ -590,9 +756,9 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+             "findings_by_type": finding_counts,
+         },
+         "data_flow": {
+-            "source": "documents joined to latest OCRResult by document_id; stored OCR blocks supply text, block_id, page_index, confidence, and bbox references",
+-            "structured_extraction_used_for_findings": False,
+-            "structured_extraction_note": "Persisted relationship extraction is not consumed by these deterministic evidence rules; its grounded entities are reported per document for diagnosis only.",
++            "source": "Documents join to the latest OCRResult by document_id; native PDF text and OCR blocks preserve separate methods, page indexes, confidence, and bounding boxes.",
++            "structured_extraction_used_for_findings": True,
++            "structured_extraction_note": "Grounded relationship assertions are included as cited supporting context when a deterministic finding references the same source block. Assertions do not independently create findings or determine their outcome.",
+         },
+         "documents": [{
+             "document_id": fact["document_id"],
+@@ -608,6 +774,11 @@ def _analysis_diagnostics(facts: list[dict[str, Any]], findings: list[dict], tim
+                 "page_number": item["page_index"] + 1 if isinstance(item.get("page_index"), int) else item.get("page_index"),
+             } for item in fact["financial_amounts"]],
+             "observed_labeled_fields": fact["observed_fields"],
++            "structured_fields": fact["structured_fields"],
++            "table_rows": fact["table_rows"],
++            "transaction_rows": fact["transaction_rows"],
++            "ownership_rows": fact["ownership_rows"],
++            "access_session_rows": fact["access_session_rows"],
+             "dates_extracted": fact["dates"],
+             "ocr_quality": fact["quality"],
+             "structured_entities": [{
+@@ -686,6 +857,64 @@ def analyze_documents(documents: list[dict]) -> dict[str, Any]:
+                 "confidence": 0.45 if date["ambiguous"] else 0.7,
+                 "evidence_refs": [_ref(fact, block_id=date["block_id"], page_index=date["page_index"], quoted_text=date["text"])],
+             })
++        sessions_by_ip: dict[str, list[dict[str, Any]]] = {}
++        for session in fact.get("access_session_rows", []):
++            fields = session.get("fields", {})
++            ip = fields.get("source ip", {}).get("normalized")
++            account = fields.get("user account", {}).get("normalized")
++            if ip and account:
++                sessions_by_ip.setdefault(ip, []).append(session)
++        for ip, sessions in sessions_by_ip.items():
++            accounts = {session["fields"]["user account"]["normalized"] for session in sessions}
++            if len(accounts) < 2:
++                continue
++            evidence_refs = []
++            for session in sessions:
++                fields = session["fields"]
++                source_blocks = {str(block.get("block_id")): block for block in fact.get("source_blocks", []) if isinstance(block, dict)}
++                mention_map = {str(item.get("mention_id")): item for item in fact.get("structured_entities", []) if isinstance(item, dict)}
++                grounded_relationships = []
++                for assertion in fact.get("structured_relationships", []):
++                    if not isinstance(assertion, dict):
++                        continue
++                    cited_blocks = [str(value) for value in assertion.get("source_block_ids", []) if str(value) in source_blocks]
++                    if session["block_id"] not in cited_blocks:
++                        continue
++                    subject = mention_map.get(str(assertion.get("subject_mention_id")), {})
++                    obj = mention_map.get(str(assertion.get("object_mention_id")), {})
++                    citation_text = " ".join(" ".join(str(source_blocks[block_id].get("text") or "").casefold().split()) for block_id in cited_blocks)
++                    grounded_mentions = [str(value.get("mention_text") or "").casefold().strip() for value in (subject, obj)]
++                    if not all(value and value in citation_text for value in grounded_mentions):
++                        continue
++                    grounded_relationships.append({
++                        "predicate": assertion.get("predicate"),
++                        "relationship_kind": assertion.get("relationship_kind"),
++                        "subject": subject.get("mention_text"),
++                        "object": obj.get("mention_text"),
++                        "source_refs": [_ref(fact, block_id=block_id, page_index=source_blocks[block_id].get("page_index"), quoted_text=source_blocks[block_id].get("text")) for block_id in cited_blocks],
++                    })
++                evidence_refs.append(_ref(
++                    fact,
++                    block_id=session["block_id"],
++                    page_index=session["page_index"],
++                    field_type="shared_source_ip",
++                    normalized_ip=ip,
++                    session_id=fields.get("session id", {}).get("normalized"),
++                    user_account=fields.get("user account", {}).get("raw"),
++                    grounded_relationships=grounded_relationships,
++                    quoted_text="; ".join(f"{key}: {value['raw']}" for key, value in fields.items()),
++                ))
++            findings.append({
++                "finding_type": "shared_access_ip",
++                "title": f"Source IP {ip} appears in multiple access accounts",
++                "description": f"The access log records {ip} for {len(accounts)} distinct user accounts. Shared infrastructure or a common VPN may explain the reuse; this is a review lead only.",
++                "severity": "low",
++                "confidence": 0.4,
++                "method": "shared_access_ip_accounts",
++                "fingerprint": f"shared-access-ip:{fact['document_id']}:{ip}",
++                "evidence_refs": evidence_refs,
++                "limitations": "An IP address may be shared by a VPN, proxy, gateway, or network address translation. The observation does not identify a person or establish unauthorized access.",
++            })
+     for digest, group in by_hash.items():
+         if len(group) < 2:
+             continue
+@@ -744,22 +973,54 @@ def analyze_documents(documents: list[dict]) -> dict[str, Any]:
+                 ],
+                 "limitations": limitation + " The identifier match is textual, and OCR-confusable characters were normalized only to surface a low-confidence candidate. Verify the unmodified source before comparing financial values.",
+             })
++    # Include exact, grounded canonical names in the persisted review graph.
++    grounded_groups: dict[tuple[str, str], set[str]] = {}
++    generic_mentions = {"document", "discrepancy", "onboarding", "code", "invoice", "ledger", "unknown"}
++    for fact in facts:
++        block_map = {str(block.get("block_id")): str(block.get("text") or "") for block in fact.get("source_blocks", []) if isinstance(block, dict)}
++        for mention in fact.get("structured_entities", []):
++            if not isinstance(mention, dict):
++                continue
++            raw_name = str(mention.get("mention_text") or "").strip()
++            entity_type = str(mention.get("entity_type") or "OTHER").upper()
++            normalized = " ".join(raw_name.casefold().split()).strip(" .,:;()[]{}")
++            if len(normalized) < 3 or normalized in generic_mentions or entity_type in {"DOCUMENT", "OTHER"}:
++                continue
++            cited = [str(value) for value in mention.get("source_block_ids", []) if str(value) in block_map]
++            if not cited or not any(normalized in " ".join(block_map[value].casefold().split()) for value in cited):
++                continue
++            grounded_groups.setdefault((entity_type, normalized), set()).add(fact["document_id"])
++    for (entity_type, normalized), document_ids in grounded_groups.items():
++        if len(document_ids) < 2:
++            continue
++        canonical_id = "entity:" + hashlib.sha256(f"{entity_type}|{normalized}".encode("utf-8")).hexdigest()[:24]
++        nodes[canonical_id] = {
++            "canonical_id": canonical_id,
++            "label": normalized,
++            "entity_type": entity_type,
++            "document_ids": sorted(document_ids),
++            "resolution": "exact_match",
++            "basis": "Exact typed entity text is grounded in source blocks from multiple documents; link remains a review candidate.",
++            "candidate_kind": "grounded_entity",
++        }
+     diagnostics = _analysis_diagnostics(facts, findings, timeline, by_hash, by_identifier)
+     return {"findings": findings, "timeline": timeline, "nodes": list(nodes.values()), "documents": facts, "diagnostics": diagnostics}
+ 
+ 
+-def build_cross_document_correlation(documents: list[dict]) -> dict[str, Any]:
++def _build_cross_document_correlation_uncached(documents: list[dict]) -> dict[str, Any]:
+     """Build explainable investigation-scoped links from persisted OCR facts.
+ 
+-    Only exact, typed document identifiers create cross-document links. Names,
+-    dates, and amounts remain comparison fields and never create identity links.
+-    Scores are rule ranks, not probabilities.
++    Typed identifiers and exact, grounded canonical entity mentions create
++    review candidates. Dates and amounts remain comparison fields and never
++    create identity links. Scores are rule ranks, not probabilities.
+     """
+     analyzed = analyze_documents(documents)
+     facts = analyzed["documents"]
+     links: list[dict[str, Any]] = []
+     comparisons: list[dict[str, Any]] = []
+     for node in analyzed["nodes"]:
++        if node.get("candidate_kind") == "grounded_entity":
++            continue
+         document_ids = list(dict.fromkeys(node["document_ids"]))
+         if len(document_ids) < 2:
+             continue
+@@ -775,9 +1036,10 @@ def build_cross_document_correlation(documents: list[dict]) -> dict[str, Any]:
+                  quoted_text=mention["text"])
+             for fact, mention in occurrences
+         ]
++        relation_type = "shared_case_link" if node["entity_type"] == "CASE_LINK" else "shared_document_identifier"
+         links.append({
+             "id": node["canonical_id"],
+-            "relation_type": "shared_document_identifier",
++            "relation_type": relation_type,
+             "normalized_identifier": value,
+             "identifier_type": node["entity_type"],
+             "document_ids": document_ids,
+@@ -785,7 +1047,10 @@ def build_cross_document_correlation(documents: list[dict]) -> dict[str, Any]:
+             "rank": 1.0,
+             "rank_kind": "exact_rule_match",
+             "method": "exact_identifier_v1",
+-            "explanation": "The same labeled document identifier appears in these source records. This is a review lead and does not prove they describe the same transaction or party.",
++            "explanation": ("The same labeled case link appears in these source records. It associates them with a case but does not prove they describe the same transaction or party." if relation_type == "shared_case_link" else "The same labeled document identifier appears in these source records. This is a review lead and does not prove they describe the same transaction or party."),
++            "evidence_kind": "explicit_source_identifier",
++            "explicit_or_inferred": "explicit",
++            "limitations": "Identifier equality supports a review lead; it does not establish a common party or transaction.",
+             "evidence_refs": references,
+             "review_status": "candidate",
+         })
+@@ -825,17 +1090,115 @@ def build_cross_document_correlation(documents: list[dict]) -> dict[str, Any]:
+             "documents": entries,
+             "explanation": "The exact identifier is shared. Labeled totals differ across sources." if has_conflict else "The exact identifier is shared. Missing values are not treated as agreement.",
+         })
++    # Persisted relationship extraction contributes candidate entity links only
++    # after source block references and the exact mention text are revalidated.
++    entity_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
++    generic_mentions = {"document", "discrepancy", "onboarding", "code", "invoice", "ledger", "unknown"}
++    for fact in facts:
++        block_map = {str(item.get("block_id")): str(item.get("text") or "") for item in fact.get("source_blocks", []) if isinstance(item, dict)}
++        for mention in fact.get("structured_entities", []):
++            if not isinstance(mention, dict):
++                continue
++            mention_text = str(mention.get("mention_text") or "").strip()
++            entity_type = str(mention.get("entity_type") or "OTHER").upper()
++            normalized = " ".join(mention_text.casefold().split()).strip(" .,:;()[]{}")
++            if len(normalized) < 3 or normalized in generic_mentions or entity_type in {"DOCUMENT", "OTHER"}:
++                continue
++            source_ids = [str(value) for value in mention.get("source_block_ids", []) if str(value) in block_map]
++            if not source_ids:
++                continue
++            mention_key = re.sub(r"\s+", " ", mention_text.casefold())
++            grounded_ids = [block_id for block_id in source_ids if mention_key in re.sub(r"\s+", " ", block_map[block_id].casefold())]
++            if not grounded_ids:
++                continue
++            group = entity_groups.setdefault((entity_type, normalized), [])
++            group.append({"fact": fact, "mention": mention, "block_ids": grounded_ids, "raw": mention_text})
++    for (entity_type, normalized), occurrences in entity_groups.items():
++        doc_ids = list(dict.fromkeys(item["fact"]["document_id"] for item in occurrences))
++        if len(doc_ids) < 2:
++            continue
++        canonical_id = "entity:" + hashlib.sha256(f"{entity_type}|{normalized}".encode("utf-8")).hexdigest()[:24]
++        references = []
++        relationship_assertions = []
++        for item in occurrences:
++            fact, mention = item["fact"], item["mention"]
++            block_map = {str(block.get("block_id")): block for block in fact.get("source_blocks", []) if isinstance(block, dict)}
++            for block_id in item["block_ids"]:
++                block = block_map.get(block_id, {})
++                references.append(_ref(
++                    fact,
++                    block_id=block_id,
++                    page_index=block.get("page_index"),
++                    quoted_text=block.get("text"),
++                    raw_mention=item["raw"],
++                    normalized_mention=normalized,
++                    entity_type=entity_type,
++                    extraction_method=block.get("extraction_method", "ocr"),
++                    relationship_kind="grounded_mention",
++                ))
++            mentioned_ids = set(item["block_ids"])
++            mentions_by_id = {
++                str(value.get("mention_id")): value
++                for value in fact.get("structured_entities", []) if isinstance(value, dict)
++            }
++            for assertion in fact.get("structured_relationships", []):
++                if not isinstance(assertion, dict):
++                    continue
++                cited_ids = [str(value) for value in assertion.get("source_block_ids", []) if str(value) in block_map]
++                if not mentioned_ids.intersection(cited_ids):
++                    continue
++                subject = mentions_by_id.get(str(assertion.get("subject_mention_id")), {})
++                obj = mentions_by_id.get(str(assertion.get("object_mention_id")), {})
++                relationship_assertions.append({
++                    "predicate": assertion.get("predicate"),
++                    "relationship_kind": assertion.get("relationship_kind"),
++                    "subject": subject.get("mention_text"),
++                    "object": obj.get("mention_text"),
++                    "document_id": fact["document_id"],
++                    "source_refs": [_ref(fact, block_id=block_id, page_index=block_map[block_id].get("page_index"), quoted_text=block_map[block_id].get("text")) for block_id in cited_ids],
++                })
++        links.append({
++            "id": canonical_id,
++            "relation_type": "shared_canonical_entity",
++            "normalized_identifier": normalized,
++            "identifier_type": entity_type,
++            "document_ids": doc_ids,
++            "document_count": len(doc_ids),
++            "rank": 0.9,
++            "rank_kind": "exact_normalized_entity_match",
++            "method": "grounded_entity_exact_v1",
++            "explanation": "The same typed entity mention was extracted from validated source blocks in multiple documents. This is an analyst review candidate, not confirmation of identity or transaction linkage.",
++            "evidence_kind": "source_grounded_entity_mentions",
++            "explicit_or_inferred": "explicit_mention_with_model_assisted_typing",
++            "limitations": "Entity typing and canonical grouping are model-assisted. Exact source text and citations are preserved, but identity has not been confirmed.",
++            "evidence_refs": references,
++            "relationship_assertions": relationship_assertions,
++            "review_status": "candidate",
++        })
++    # Surface high-precision local matches while model enrichment is pending.
++    # The candidate builder uses only typed exact matches and source citations.
++    deterministic_links = build_deterministic_relationship_candidates(facts)
++    existing_pairs = {
++        (str(link.get("identifier_type") or "").upper(), str(link.get("normalized_identifier") or ""))
++        for link in links
++    }
++    deterministic_links = [
++        link for link in deterministic_links
++        if (link["identifier_type"].upper(), link["normalized_identifier"]) not in existing_pairs
++    ]
++    links.extend(deterministic_links)
+     status = "no_documents" if not documents else "ready" if any(doc.get("blocks") or doc.get("text") for doc in documents) else "no_ocr_results"
+     return {
+         "status": status,
+-        "method": "deterministic_exact_identifier_v1",
++            "method": "hybrid_deterministic_exact_v2",
+         "summary": {
+             "documents_total": len(documents),
+             "documents_with_ocr": sum(bool(fact["text"] or fact["identifiers"]) for fact in facts),
+-            "documents_pending": sum(doc.get("processing_status") in {"pending", "queued", "processing", "relationship_extraction_pending"} for doc in documents),
++            "documents_pending": sum(doc.get("processing_status") in {"pending", "queued", "processing", "relationship_extraction_pending", "relationship_extraction_processing"} for doc in documents),
+             "documents_with_processing_errors": sum(doc.get("processing_status") in {"failed", "relationship_extraction_failed"} for doc in documents),
+             "identifier_mentions": sum(len(fact["identifiers"]) for fact in facts),
+             "candidate_entities": len(analyzed["nodes"]),
++            "deterministic_candidate_links": len(deterministic_links),
+             "total_links": len(links),
+             "candidate_links": len(links),
+             "confirmed_links": 0,
+@@ -851,3 +1214,52 @@ def build_cross_document_correlation(documents: list[dict]) -> dict[str, Any]:
+         ],
+         "limitations": "Exact labeled identifiers are candidate links, not identity or transaction proof. Dates and amounts are comparison signals only. OCR uncertainty and unlabeled fields can affect results.",
+     }
++
++
++_CORRELATION_CACHE_MAX_ENTRIES = 8
++_CORRELATION_CACHE_MAX_VALUE_BYTES = 2_000_000
++_CORRELATION_CACHE_MAX_INPUT_BYTES = 8_000_000
++_correlation_cache: OrderedDict[str, tuple[dict[str, Any], int]] = OrderedDict()
++_correlation_cache_bytes = 0
++_correlation_cache_lock = threading.RLock()
++
++
++def build_cross_document_correlation(documents: list[dict], *, include_timings: bool = False) -> dict[str, Any]:
++    """Cache repeat correlation reads by a content-complete fingerprint.
++
++    Review state is overlaid by the API after this function returns, so it is
++    intentionally not cached here. Cached results are copied before return.
++    """
++    started = time.perf_counter()
++    serialized = json.dumps(documents, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
++    if len(serialized.encode("utf-8")) <= _CORRELATION_CACHE_MAX_INPUT_BYTES:
++        cache_key = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
++        with _correlation_cache_lock:
++            cached = _correlation_cache.get(cache_key)
++            if cached is not None:
++                _correlation_cache.move_to_end(cache_key)
++                result = copy.deepcopy(cached[0])
++                if include_timings:
++                    elapsed = round((time.perf_counter() - started) * 1000, 3)
++                    result["timings_ms"] = {"cache_hit": True, "deterministic_computation": elapsed}
++                return result
++
++    result = _build_cross_document_correlation_uncached(documents)
++    computation_ms = round((time.perf_counter() - started) * 1000, 3)
++    encoded_result = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
++    value_bytes = len(encoded_result.encode("utf-8"))
++    if len(serialized.encode("utf-8")) <= _CORRELATION_CACHE_MAX_INPUT_BYTES and value_bytes <= _CORRELATION_CACHE_MAX_VALUE_BYTES:
++        global _correlation_cache_bytes
++        stored_result = copy.deepcopy(result)
++        with _correlation_cache_lock:
++            previous = _correlation_cache.pop(cache_key, None)
++            if previous:
++                _correlation_cache_bytes -= previous[1]
++            _correlation_cache[cache_key] = (stored_result, value_bytes)
++            _correlation_cache_bytes += value_bytes
++            while len(_correlation_cache) > _CORRELATION_CACHE_MAX_ENTRIES or _correlation_cache_bytes > _CORRELATION_CACHE_MAX_ENTRIES * _CORRELATION_CACHE_MAX_VALUE_BYTES:
++                _old_key, (_old_value, old_bytes) = _correlation_cache.popitem(last=False)
++                _correlation_cache_bytes -= old_bytes
++    if include_timings:
++        result["timings_ms"] = {"cache_hit": False, "deterministic_computation": computation_ms}
++    return result
+diff --git a/backend/app/services/ocr_worker.py b/backend/app/services/ocr_worker.py
+index 13291d7..3b1243a 100644
+--- a/backend/app/services/ocr_worker.py
++++ b/backend/app/services/ocr_worker.py
+@@ -1,13 +1,17 @@
+ """Durable database-polled OCR worker for local/single-worker deployments."""
+ import atexit
+ import json
++import asyncio
+ import os
+ import subprocess
+ import threading
+ import time
++import uuid
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ 
++import fitz
++
+ from sqlalchemy import func, select
+ 
+ from app.core.config import settings
+@@ -21,6 +25,13 @@ OCR_PROJECT = Path(os.getenv("PADDLEOCR_PROJECT_PATH", str(REPO_ROOT.parent / "e
+ SERVICE_SCRIPT = BACKEND_ROOT / "scripts" / "paddle_service.py"
+ OCR_TIMEOUT_SECONDS = 600
+ OCR_INIT_TIMEOUT_SECONDS = 900
++STALE_JOB_TIMEOUT_SECONDS = OCR_INIT_TIMEOUT_SECONDS + OCR_TIMEOUT_SECONDS + 300
++
++
++class _RelationshipPersistenceError(RuntimeError):
++    def __init__(self, exception_type: str):
++        self.exception_type = exception_type
++        super().__init__("relationship chunk persistence failed")
+ 
+ _server: subprocess.Popen | None = None
+ _server_lock = threading.Lock()
+@@ -127,6 +138,117 @@ def _run_engine(path: Path) -> tuple[dict | list, str]:
+             raise
+ 
+ 
++def _native_pdf_blocks(path: Path) -> list[dict]:
++    """Extract selectable PDF text as separate, source-linked observations.
++
++    OCR continues to run on every page. Native spans supplement that output and
++    retain their own method, coordinates, and stable page-local identifiers.
++    """
++    if not _is_pdf_file(path):
++        return []
++    blocks: list[dict] = []
++    with fitz.open(path) as document:
++        for page_index, page in enumerate(document):
++            detected_tables = page.find_tables().tables
++            table_bounds = [fitz.Rect(table.bbox) for table in detected_tables if table.bbox]
++            raw_blocks = page.get_text("dict", sort=False).get("blocks", [])
++            page_block_index = 0
++            for raw_block in raw_blocks:
++                lines = raw_block.get("lines")
++                if not isinstance(lines, list):
++                    continue
++                text = "\n".join(
++                    "".join(str(span.get("text") or "") for span in line.get("spans", []))
++                    for line in lines
++                ).strip()
++                if not text:
++                    continue
++                bbox = raw_block.get("bbox")
++                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
++                    region = fitz.Rect(bbox)
++                    if any(region.intersects(table_box) and region.get_area() > 0 and table_box.get_area() > 0
++                           and region.intersect(table_box).get_area() / min(region.get_area(), table_box.get_area()) >= 0.5
++                           for table_box in table_bounds):
++                        continue
++                page_block_index += 1
++                blocks.append({
++                    "block_id": f"native_p{page_index + 1:04d}_b{page_block_index:05d}",
++                    "source_path": f"page[{page_index}].native_text.blocks[{page_block_index - 1}]",
++                    "text": text,
++                    "page_index": page_index,
++                    "engine_bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
++                    "bbox_space": "pdf_points",
++                    "extraction_method": "native_pdf_text",
++                    "engine_confidence": None,
++                })
++            for table_index, table in enumerate(detected_tables, start=1):
++                extracted_rows = table.extract()
++                headers = [" ".join(str(value or "").split()) for value in (table.header.names or [])]
++                known_headers = {
++                    "full name", "role", "role / title", "identifier", "ownership %", "tx id", "transaction id",
++                    "date", "date (utc)", "originator", "beneficiary entity", "beneficiary account", "amount", "amount (usd)",
++                    "approver", "session id", "timestamp", "timestamp (utc)", "user account", "source ip", "target resource accessed",
++                }
++                headers_are_grounded = any(" ".join(header.casefold().replace("\n", " ").split()) in known_headers for header in headers)
++                if not headers_are_grounded:
++                    headers = []
++                rows = extracted_rows[1:] if headers_are_grounded else extracted_rows
++                row_offset = 1 if headers_are_grounded else 0
++                for row_index, row in enumerate(rows, start=row_offset):
++                    cells = []
++                    for column_index, raw_value in enumerate(row):
++                        value = " ".join(str(raw_value or "").split())
++                        if not value:
++                            continue
++                        cell_box = None
++                        try:
++                            raw_box = table.rows[row_index].cells[column_index]
++                            if raw_box:
++                                cell_box = [round(float(item), 3) for item in raw_box]
++                        except (IndexError, TypeError, ValueError):
++                            cell_box = None
++                        cells.append({
++                            "column_index": column_index,
++                            "header": headers[column_index] if column_index < len(headers) else None,
++                            "raw_text": value,
++                            "bbox": cell_box,
++                        })
++                    if not cells:
++                        continue
++                    page_block_index += 1
++                    row_text = " | ".join(
++                        "{}: {}".format(cell.get("header") or f"column_{cell['column_index'] + 1}", cell["raw_text"])
++                        for cell in cells
++                    )
++                    row_box = table.rows[row_index].bbox if hasattr(table.rows[row_index], "bbox") else table.bbox
++                    blocks.append({
++                        "block_id": f"native_p{page_index + 1:04d}_table{table_index:03d}_row{row_index:04d}",
++                        "source_path": f"page[{page_index}].native_text.tables[{table_index - 1}].rows[{row_index}]",
++                        "text": row_text,
++                        "page_index": page_index,
++                        "engine_bbox": [round(float(item), 3) for item in row_box] if row_box else list(table.bbox),
++                        "bbox_space": "pdf_points",
++                        "extraction_method": "native_pdf_table",
++                        "engine_confidence": None,
++                        "table_structure_status": "detected" if headers_are_grounded else "uncertain",
++                        "table_index": table_index - 1,
++                        "row_index": row_index,
++                        "cells": cells,
++                    })
++    return blocks
++
++
++def _is_pdf_file(path: Path) -> bool:
++    """Recognize PDFs by content because secure upload keys have no suffix."""
++    if path.suffix.lower() == ".pdf":
++        return True
++    try:
++        with path.open("rb") as source:
++            return source.read(5) == b"%PDF-"
++    except OSError:
++        return False
++
++
+ def _blocks(raw: object) -> list[dict]:
+     blocks: list[dict] = []
+ 
+@@ -134,7 +256,7 @@ def _blocks(raw: object) -> list[dict]:
+             confidence: object = None, engine_block_id: object = None, page_index: int | None = None) -> None:
+         if not isinstance(text, str) or not text.strip():
+             return
+-        block = {"block_id": f"block_{len(blocks)+1:06d}", "source_path": source_path, "text": text.strip()}
++        block = {"block_id": f"block_{len(blocks)+1:06d}", "source_path": source_path, "text": text.strip(), "extraction_method": "ocr"}
+         if page_index is not None:
+             block["page_index"] = page_index
+         if isinstance(engine_block_id, (str, int)):
+@@ -205,12 +327,27 @@ def _blocks(raw: object) -> list[dict]:
+     return blocks
+ 
+ 
++def _logical_text(blocks: list[dict]) -> str:
++    """Build search text without counting identical OCR/native blocks twice."""
++    seen: set[str] = set()
++    text: list[str] = []
++    for block in blocks:
++        value = str(block.get("text") or "").strip()
++        key = " ".join(value.casefold().split())
++        if value and key not in seen:
++            seen.add(key)
++            text.append(value)
++    return "\n".join(text)
++
++
+ async def _mark_failed(doc_id, message: str, extraction_run_id=None) -> None:
+     async with SessionLocal() as db:
+-        current = await db.scalar(select(Document).where(Document.id == doc_id))
++        current = await db.scalar(select(Document).where(Document.id == doc_id).with_for_update())
+         if current:
+             current.processing_status = "failed"
+-            current.processing_error = message[:500]
++            current.processing_error = "OCR extraction failed. Check the extraction run diagnostics."
++            current.processing_error_code = "ocr_extraction_failed"
++            current.processing_error_retryable = True
+             current.processing_completed_at = datetime.now(timezone.utc)
+             if extraction_run_id:
+                 run = await db.scalar(select(ExtractionRun).where(ExtractionRun.id == extraction_run_id))
+@@ -230,65 +367,592 @@ async def _mark_failed(doc_id, message: str, extraction_run_id=None) -> None:
+             await db.commit()
+ 
+ 
++def _relationship_blocks(blocks: list[dict]) -> list[dict]:
++    seen_ids: set[str] = set()
++    result: list[dict] = []
++    for block in blocks:
++        block_id = str(block.get("block_id") or "")
++        if not block_id or not str(block.get("text") or "").strip() or block_id in seen_ids:
++            continue
++        seen_ids.add(block_id)
++        result.append(block)
++    return result
++
++
++async def _persist_deterministic_evidence(doc_id) -> dict:
++    """Persist deterministic source evidence before optional AI enrichment."""
++    from app.services.deterministic_relationships import _mentions_from_facts
++    from app.services.ocr_metrics import build_cross_document_correlation, extract_document_facts
++
++    async with SessionLocal() as db:
++        current = await db.scalar(select(Document).where(Document.id == doc_id))
++        if current is None:
++            raise RuntimeError("Document disappeared before deterministic analysis")
++        investigation_id = current.investigation_id
++        source_sha256 = current.sha256
++        rows = (await db.execute(
++            select(Document, OCRResult, RelationshipAnalysis)
++            .outerjoin(OCRResult, OCRResult.document_id == Document.id)
++            .outerjoin(RelationshipAnalysis, RelationshipAnalysis.document_id == Document.id)
++            .where(Document.investigation_id == investigation_id)
++            .order_by(Document.created_at, Document.id)
++        )).all()
++
++    documents = [{
++        "document_id": str(document.id), "filename": document.filename,
++        "sha256": document.sha256,
++        "provider": ocr.provider if ocr else None,
++        "provider_version": ocr.provider_version if ocr else None,
++        "blocks": ocr.blocks if ocr and isinstance(ocr.blocks, list) else [],
++        "text": ocr.recognized_text if ocr else "",
++        "processing_status": document.processing_status,
++        "structured_extraction": analysis.payload if analysis else None,
++    } for document, ocr, analysis in rows]
++    facts = [extract_document_facts(document) for document in documents]
++    current_facts = next((fact for fact in facts if fact["document_id"] == str(doc_id)), None)
++    if current_facts is None:
++        raise RuntimeError("Current document is missing from its investigation evidence set")
++    correlation = build_cross_document_correlation(documents)
++    candidates = [
++        item for item in correlation.get("links", [])
++        if item.get("method") == "deterministic_relationship_candidate_v1"
++        and str(doc_id) in item.get("document_ids", [])
++    ]
++    mentions = _mentions_from_facts([current_facts])
++    completed_at = datetime.now(timezone.utc)
++
++    async with SessionLocal() as db:
++        current = await db.scalar(select(Document).where(Document.id == doc_id).with_for_update())
++        if current is None or current.sha256 != source_sha256:
++            raise RuntimeError("Source document changed during deterministic analysis")
++        record = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc_id))
++        payload = dict(record.payload) if record and isinstance(record.payload, dict) else {}
++        deterministic = {
++            "status": "completed", "correlation_status": "completed",
++            "pipeline_version": "deterministic_relationship_candidate_v1",
++            "source_sha256": source_sha256, "completed_at": completed_at.isoformat(),
++            "entity_count": len(mentions), "relationship_candidate_count": len(candidates),
++            "entities": mentions, "relationship_candidates": candidates,
++        }
++        payload["deterministic_analysis"] = deterministic
++        payload["analysis_stages"] = {
++            "source_extraction": "completed", "deterministic_evidence": "completed",
++            "investigation_correlation": "completed", "ai_enrichment": "pending",
++            "investigator_review": "pending",
++        }
++        if record:
++            record.payload = payload
++        else:
++            db.add(RelationshipAnalysis(document_id=doc_id, model=settings.llm_model, payload=payload))
++        await append_audit(
++            db, investigation_id=investigation_id, actor_user_id=None,
++            action="deterministic_relationships.completed", target_type="document",
++            target_id=str(doc_id), details={
++                "source_sha256": source_sha256,
++                "pipeline_version": deterministic["pipeline_version"],
++                "entity_count": len(mentions),
++                "relationship_candidate_count": len(candidates),
++                "documents_considered": len(documents),
++            },
++        )
++        await db.commit()
++    return deterministic
++
++
++async def _persist_relationship_failure(doc_id, run_id, error, *, started_at, input_blocks, input_characters):
++    async with SessionLocal() as db:
++        current = await db.scalar(select(Document).where(Document.id == doc_id))
++        if current is None:
++            return
++        completed_at = datetime.now(timezone.utc)
++        duration_ms = round((completed_at - started_at).total_seconds() * 1000, 2)
++        current.processing_status = "relationship_extraction_failed"
++        current.processing_error = str(error)[:500]
++        current.processing_error_code = error.code
++        current.processing_error_retryable = error.retryable
++        current.processing_completed_at = completed_at
++        partial = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc_id))
++        if partial and isinstance(partial.payload, dict):
++            payload = dict(partial.payload)
++            if isinstance(payload.get("run"), dict):
++                run_metadata = dict(payload["run"])
++                run_metadata["status"] = "partial" if payload.get("chunks") else "failed"
++                run_metadata["error_code"] = error.code
++                run_metadata["failed_chunk_id"] = error.failed_chunk_id
++                payload["run"] = run_metadata
++            stages = dict(payload.get("analysis_stages") or {})
++            stages["ai_enrichment"] = "failed"
++            payload["analysis_stages"] = stages
++            partial.payload = payload
++        await append_audit(
++            db,
++            investigation_id=current.investigation_id,
++            actor_user_id=None,
++            action="relationship_extraction.failed",
++            target_type="document",
++            target_id=str(current.id),
++            details={
++                "run_id": str(run_id), "error_code": error.code,
++                "retryable": error.retryable, "diagnostics": error.diagnostics,
++                "duration_ms": duration_ms, "input_block_count": input_blocks,
++                "input_characters": input_characters, "model": settings.llm_model,
++                "failed_chunk_id": error.failed_chunk_id,
++            },
++        )
++        await db.commit()
++    print(
++        f"Relationship extraction failed for document {doc_id} "
++        f"(code={error.code}, retryable={error.retryable}, duration_ms={duration_ms})",
++        flush=True,
++    )
++
++
++async def _persist_relationship_chunk(doc_id, investigation_id, source_sha256, model, run_id, chunk, block_by_id):
++    from app.services.relationship_extraction import EXTRACTION_PIPELINE_VERSION, _merge_relationship_chunks
++
++    chunk["run_id"] = str(run_id)
++    async with SessionLocal() as db:
++        current = await db.scalar(select(Document).where(Document.id == doc_id))
++        if current is None or current.sha256 != source_sha256:
++            raise RuntimeError("Source document changed during relationship extraction")
++        record = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc_id))
++        previous = record.payload if record and isinstance(record.payload, dict) else {}
++        deterministic = previous.get("deterministic_analysis")
++        previous_run = previous.get("run") if isinstance(previous.get("run"), dict) else {}
++        if (
++            previous_run.get("source_sha256") != source_sha256
++            or previous.get("model") != model
++            or previous.get("pipeline_version") != EXTRACTION_PIPELINE_VERSION
++            or previous_run.get("status") != "partial"
++        ):
++            previous = {}
++        chunk_map = {
++            item.get("chunk_id"): item
++            for item in previous.get("chunks", [])
++            if isinstance(item, dict) and item.get("chunk_id") and item.get("status") == "completed"
++        }
++        chunk_map[chunk["chunk_id"]] = chunk
++        chunks = list(chunk_map.values())
++        entities, relationships = _merge_relationship_chunks(chunks)
++        chunks_by_id = {item["chunk_id"]: item for item in chunks}
++
++        def make_references(block_ids, chunk_ids):
++            refs = []
++            for block_id in block_ids:
++                block = block_by_id.get(str(block_id))
++                if not block:
++                    continue
++                applicable = [chunks_by_id[cid] for cid in chunk_ids if cid in chunks_by_id and block_id in chunks_by_id[cid].get("input_block_ids", [])]
++                for item in applicable or [None]:
++                    page_index = block.get("page_index")
++                    refs.append({
++                        "document_id": str(doc_id), "investigation_id": str(investigation_id),
++                        "run_id": item.get("run_id") if item else str(run_id),
++                        "source_sha256": source_sha256, "block_id": str(block_id),
++                        "page_index": page_index,
++                        "page_number": page_index + 1 if isinstance(page_index, int) and not isinstance(page_index, bool) else None,
++                        "extraction_method": block.get("extraction_method", "ocr"),
++                        "coordinate_space": block.get("bbox_space"),
++                        "bounding_box": block.get("engine_bbox"), "quoted_text": block.get("text"),
++                    })
++            return refs
++
++        for entity in entities:
++            entity["source_references"] = make_references(entity.get("source_block_ids", []), entity.get("chunk_ids", []))
++            entity["provenance"] = {"document_id": str(doc_id), "investigation_id": str(investigation_id), "run_ids": [chunks_by_id[cid].get("run_id") for cid in entity.get("chunk_ids", []) if cid in chunks_by_id]}
++        for relation in relationships:
++            relation["source_references"] = make_references(relation.get("source_block_ids", []), relation.get("chunk_ids", []))
++            relation["provenance"] = {"document_id": str(doc_id), "investigation_id": str(investigation_id), "run_ids": [chunks_by_id[cid].get("run_id") for cid in relation.get("chunk_ids", []) if cid in chunks_by_id]}
++
++        current.processing_started_at = datetime.now(timezone.utc)
++        payload = {
++            "schema_version": "relationship_extraction_v1", "model": model,
++            "pipeline_version": EXTRACTION_PIPELINE_VERSION,
++            "status": "partial", "entities": entities, "relationships": relationships,
++            "chunks": chunks,
++            "run": {"run_id": str(run_id), "source_sha256": source_sha256, "model": model, "status": "partial"},
++        }
++        if isinstance(deterministic, dict):
++            payload["deterministic_analysis"] = deterministic
++            payload["analysis_stages"] = {
++                "source_extraction": "completed",
++                "deterministic_evidence": deterministic.get("status", "completed"),
++                "investigation_correlation": deterministic.get("correlation_status", "completed"),
++                "ai_enrichment": "processing", "investigator_review": "pending",
++            }
++        if record:
++            record.model = model
++            record.payload = payload
++        else:
++            db.add(RelationshipAnalysis(document_id=doc_id, model=model, payload=payload))
++        await append_audit(
++            db, investigation_id=investigation_id, actor_user_id=None,
++            action="relationship_extraction.chunk_completed", target_type="relationship_extraction_run",
++            target_id=str(run_id), details={
++                "document_id": str(doc_id), "chunk_id": chunk["chunk_id"],
++                "chunk_number": chunk["chunk_number"], "duration_ms": chunk["duration_ms"],
++                "llm_request_ms": chunk.get("llm_request_ms", 0),
++                "attempts": chunk["attempts"], "entity_count": len(chunk["entities"]),
++                "relationship_count": len(chunk["relationships"]), "source_block_count": len(chunk["input_block_ids"]),
++            },
++        )
++        await db.commit()
++
++
++async def _run_relationship_extraction(doc_id) -> None:
++    from app.services.relationship_extraction import (
++        EXTRACTION_PIPELINE_VERSION, RelationshipExtractionError, extract, relationship_cache_key,
++    )
++
++    worker_started = time.perf_counter()
++    async with SessionLocal() as db:
++        current = await db.scalar(select(Document).where(Document.id == doc_id).with_for_update())
++        result = await db.scalar(select(OCRResult).where(OCRResult.document_id == doc_id))
++        if current is None or current.processing_status != "relationship_extraction_pending":
++            return
++        investigation_id = current.investigation_id
++        source_sha256 = current.sha256
++        document_id = current.id
++        blocks = _relationship_blocks(result.blocks if result and isinstance(result.blocks, list) else [])
++        block_by_id = {str(block.get("block_id")): block for block in blocks if block.get("block_id")}
++        record = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc_id))
++        previous_payload = record.payload if record and isinstance(record.payload, dict) else {}
++        previous_run = previous_payload.get("run") if isinstance(previous_payload.get("run"), dict) else {}
++        cache_key = relationship_cache_key(blocks, model=settings.llm_model)
++        if (
++            previous_run.get("status") == "completed"
++            and previous_run.get("source_sha256") == source_sha256
++            and previous_run.get("model") == settings.llm_model
++            and previous_run.get("pipeline_version") == EXTRACTION_PIPELINE_VERSION
++            and previous_run.get("cache_key") == cache_key
++        ):
++            completed_at = datetime.now(timezone.utc)
++            current.processing_status = "relationship_extraction_completed"
++            current.processing_error = None
++            current.processing_error_code = None
++            current.processing_error_retryable = None
++            current.processing_completed_at = completed_at
++            await append_audit(
++                db, investigation_id=investigation_id, actor_user_id=None,
++                action="relationship_extraction.cache_hit", target_type="document",
++                target_id=str(document_id), details={
++                    "source_sha256": source_sha256, "model": settings.llm_model,
++                    "pipeline_version": EXTRACTION_PIPELINE_VERSION,
++                    "duration_ms": round((time.perf_counter() - worker_started) * 1000, 3),
++                },
++            )
++            await db.commit()
++            print(
++                f"Relationship extraction cache hit for document {document_id} "
++                f"(duration_ms={round((time.perf_counter() - worker_started) * 1000, 2)}, provider_calls=0)",
++                flush=True,
++            )
++            return
++        if current.relationship_extraction_attempts >= 3:
++            current.processing_status = "relationship_extraction_failed"
++            current.processing_error = "Relationship extraction reached the retry limit."
++            current.processing_error_code = "retry_limit_exceeded"
++            current.processing_error_retryable = False
++            current.processing_completed_at = datetime.now(timezone.utc)
++            await db.commit()
++            return
++        current.relationship_extraction_attempts += 1
++        current.processing_status = "relationship_extraction_processing"
++        current.processing_started_at = datetime.now(timezone.utc)
++        current.processing_error = None
++        current.processing_error_code = None
++        current.processing_error_retryable = None
++        attempt = current.relationship_extraction_attempts
++        resume_chunks = previous_payload.get("chunks", []) if (
++            previous_run.get("source_sha256") == source_sha256
++            and previous_payload.get("model") == settings.llm_model
++            and previous_payload.get("pipeline_version") == EXTRACTION_PIPELINE_VERSION
++            and previous_run.get("status") == "partial"
++            and isinstance(previous_payload.get("chunks"), list)
++        ) else []
++        input_characters = sum(len(str(block.get("text") or "")) for block in blocks)
++        run_id = uuid.uuid4()
++        started_at = datetime.now(timezone.utc)
++        await append_audit(
++            db,
++            investigation_id=investigation_id,
++            actor_user_id=None,
++            action="relationship_extraction.started",
++            target_type="relationship_extraction_run",
++            target_id=str(run_id),
++            details={
++                "document_id": str(document_id), "source_sha256": source_sha256,
++                "model": settings.llm_model, "input_block_count": len(blocks),
++                "input_characters": input_characters,
++                "attempt": attempt,
++            },
++        )
++        await db.commit()
++
++    try:
++        deterministic = await _persist_deterministic_evidence(doc_id)
++        async with SessionLocal() as db:
++            record = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc_id))
++            if record and isinstance(record.payload, dict):
++                payload = dict(record.payload)
++                stages = dict(payload.get("analysis_stages") or {})
++                stages["ai_enrichment"] = "processing"
++                payload["analysis_stages"] = stages
++                record.payload = payload
++                await db.commit()
++        if blocks:
++            loop = asyncio.get_running_loop()
++            checkpoint_persistence_ms = []
++
++            def persist_chunk(chunk):
++                persistence_started = time.perf_counter()
++                future = asyncio.run_coroutine_threadsafe(
++                    _persist_relationship_chunk(
++                        doc_id, investigation_id, source_sha256, settings.llm_model,
++                        run_id, chunk, block_by_id,
++                    ),
++                    loop,
++                )
++                try:
++                    future.result()
++                except Exception as exc:
++                    raise _RelationshipPersistenceError(type(exc).__name__) from None
++                checkpoint_persistence_ms.append(round((time.perf_counter() - persistence_started) * 1000, 3))
++
++            graph, metadata = await asyncio.to_thread(
++                extract, blocks,
++                completed_chunks=resume_chunks,
++                on_chunk_completed=persist_chunk,
++            )
++        else:
++            checkpoint_persistence_ms = []
++            graph, metadata = (
++                {"schema_version": "relationship_extraction_v1", "entities": [], "relationships": []},
++                {"usage": [], "chunk_count": 0, "input_block_count": 0, "input_characters": 0, "attempts": 0, "duration_ms": 0},
++            )
++        completed_at = datetime.now(timezone.utc)
++        elapsed_ms = round((completed_at - started_at).total_seconds() * 1000, 2)
++        graph["usage"] = metadata.get("usage", [])
++        graph["pipeline_version"] = EXTRACTION_PIPELINE_VERSION
++        stage_timings = dict(metadata.get("stage_timings_ms", {}))
++        stage_timings["database_checkpoint_persistence_ms"] = round(sum(checkpoint_persistence_ms), 3)
++        chunk_run_ids = {item["chunk_id"]: item.get("run_id", str(run_id)) for item in graph.get("chunks", [])}
++        chunks_by_id = {item["chunk_id"]: item for item in graph.get("chunks", [])}
++
++        def source_references(block_ids: list[str], chunk_ids: list[str]) -> list[dict]:
++            refs = []
++            for block_id in block_ids:
++                block = block_by_id.get(str(block_id))
++                if not block:
++                    continue
++                matching = [chunks_by_id[cid] for cid in chunk_ids if cid in chunks_by_id and block_id in chunks_by_id[cid].get("input_block_ids", [])]
++                for chunk in matching or [None]:
++                    page_index = block.get("page_index")
++                    refs.append({
++                        "document_id": str(doc_id), "investigation_id": str(investigation_id),
++                        "run_id": chunk.get("run_id", str(run_id)) if chunk else str(run_id),
++                        "source_sha256": source_sha256, "block_id": str(block_id),
++                        "page_index": page_index,
++                        "page_number": page_index + 1 if isinstance(page_index, int) and not isinstance(page_index, bool) else None,
++                        "extraction_method": block.get("extraction_method", "ocr"),
++                        "coordinate_space": block.get("bbox_space"),
++                        "bounding_box": block.get("engine_bbox"), "quoted_text": block.get("text"),
++                    })
++            return refs
++
++        for entity in graph.get("entities", []):
++            entity["source_references"] = source_references(entity.get("source_block_ids", []), entity.get("chunk_ids", []))
++            entity["provenance"] = {"document_id": str(doc_id), "investigation_id": str(investigation_id), "run_ids": [chunk_run_ids[cid] for cid in entity.get("chunk_ids", []) if cid in chunk_run_ids]}
++        for relation in graph.get("relationships", []):
++            relation["source_references"] = source_references(relation.get("source_block_ids", []), relation.get("chunk_ids", []))
++            relation["provenance"] = {"document_id": str(doc_id), "investigation_id": str(investigation_id), "run_ids": [chunk_run_ids[cid] for cid in relation.get("chunk_ids", []) if cid in chunk_run_ids]}
++
++        graph["run"] = {
++            "run_id": str(run_id), "document_id": str(doc_id),
++            "investigation_id": str(investigation_id),
++            "source_sha256": source_sha256, "model": settings.llm_model,
++            "provider": settings.llm_provider, "schema_version": graph.get("schema_version"),
++            "pipeline_version": EXTRACTION_PIPELINE_VERSION,
++            "cache_key": metadata.get("cache_key"),
++            "started_at": started_at.isoformat(), "completed_at": completed_at.isoformat(),
++            "duration_ms": metadata.get("duration_ms", elapsed_ms),
++            "input_block_count": len(blocks), "input_characters": input_characters,
++            "chunk_count": metadata.get("chunk_count", 1 if blocks else 0),
++            "attempts": metadata.get("attempts", 1 if blocks else 0),
++            "stage_timings_ms": stage_timings,
++            "status": "completed" if blocks else "skipped_empty_input",
++        }
++        graph["deterministic_analysis"] = deterministic
++        graph["analysis_stages"] = {
++            "source_extraction": "completed",
++            "deterministic_evidence": deterministic["status"],
++            "investigation_correlation": deterministic["correlation_status"],
++            "ai_enrichment": "completed", "investigator_review": "pending",
++        }
++
++        graph["chunks"] = [{key: value for key, value in chunk.items() if key not in {"entities", "relationships"}} for chunk in graph.get("chunks", [])]
++
++        async with SessionLocal() as db:
++            current = await db.scalar(select(Document).where(Document.id == doc_id))
++            if current is None:
++                return
++            record = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc_id))
++            if record:
++                record.model = settings.llm_model
++                record.payload = graph
++            else:
++                db.add(RelationshipAnalysis(document_id=doc_id, model=settings.llm_model, payload=graph))
++            current.processing_status = "relationship_extraction_completed"
++            current.processing_error = None
++            current.processing_error_code = None
++            current.processing_error_retryable = None
++            current.processing_completed_at = completed_at
++            await append_audit(
++                db,
++                investigation_id=current.investigation_id,
++                actor_user_id=None,
++                action="relationship_extraction.completed",
++                target_type="document",
++                target_id=str(current.id),
++                details={
++                    "run_id": str(run_id), "model": settings.llm_model,
++                    "duration_ms": graph["run"]["duration_ms"],
++                    "input_block_count": len(blocks), "input_characters": input_characters,
++                    "chunk_count": graph["run"]["chunk_count"], "attempts": graph["run"]["attempts"],
++                    "entity_count": len(graph.get("entities", [])),
++                    "relationship_count": len(graph.get("relationships", [])),
++                    "stage_timings_ms": stage_timings,
++                },
++            )
++            await db.commit()
++        print(
++            f"Relationship extraction completed for document {doc_id} "
++            f"(duration_ms={graph['run']['duration_ms']}, entities={len(graph.get('entities', []))}, "
++            f"relationships={len(graph.get('relationships', []))}, chunks={graph['run']['chunk_count']}, "
++            f"stage_timings_ms={json.dumps(stage_timings, sort_keys=True)})",
++            flush=True,
++        )
++    except RelationshipExtractionError as exc:
++        await _persist_relationship_failure(
++            doc_id, run_id, exc, started_at=started_at,
++            input_blocks=len(blocks), input_characters=input_characters,
++        )
++    except _RelationshipPersistenceError as exc:
++        error = RelationshipExtractionError(
++            "relationship_persistence_failed", "Relationship chunk results could not be persisted; retry is safe.",
++            retryable=True, diagnostics={"exception_type": exc.exception_type},
++        )
++        await _persist_relationship_failure(
++            doc_id, run_id, error, started_at=started_at,
++            input_blocks=len(blocks), input_characters=input_characters,
++        )
++    except Exception as exc:
++        error = RelationshipExtractionError(
++            "relationship_internal_error", "Relationship extraction failed unexpectedly.",
++            retryable=False, diagnostics={"exception_type": type(exc).__name__},
++        )
++        await _persist_relationship_failure(
++            doc_id, run_id, error, started_at=started_at,
++            input_blocks=len(blocks), input_characters=input_characters,
++        )
++
++
+ async def process_one() -> bool:
+     async with SessionLocal() as db:
+-        expired_at = datetime.now(timezone.utc) - timedelta(minutes=15)
++        expired_at = datetime.now(timezone.utc) - timedelta(seconds=STALE_JOB_TIMEOUT_SECONDS)
+         stale = (await db.scalars(select(Document).where(
+-            Document.processing_status.in_(["processing", "relationship_extraction_pending"]),
++            Document.processing_status.in_(["processing", "relationship_extraction_processing"]),
+             Document.processing_started_at < expired_at,
+         ).with_for_update(skip_locked=True))).all()
+         for item in stale:
+-            item.processing_status = "failed"
+-            item.processing_error = "Processing worker stopped before completion"
+-            item.processing_completed_at = datetime.now(timezone.utc)
++            completed_at = datetime.now(timezone.utc)
++            if item.processing_status == "relationship_extraction_processing":
++                item.processing_status = "relationship_extraction_failed"
++                item.processing_error = "Relationship extraction worker stopped before completion."
++                item.processing_error_code = "relationship_worker_interrupted"
++                item.processing_error_retryable = True
++                action = "relationship_extraction.failed"
++            else:
++                item.processing_status = "failed"
++                item.processing_error = "OCR worker stopped before completion."
++                item.processing_error_code = "ocr_worker_interrupted"
++                item.processing_error_retryable = True
++                action = "extraction.failed"
++            item.processing_completed_at = completed_at
++            await append_audit(
++                db,
++                investigation_id=item.investigation_id,
++                actor_user_id=None,
++                action=action,
++                target_type="document",
++                target_id=str(item.id),
++                details={"error_code": item.processing_error_code, "retryable": True},
++            )
+         if stale:
+             await db.commit()
+-        doc = await db.scalar(select(Document).where(Document.processing_status == "queued").order_by(Document.created_at).with_for_update(skip_locked=True).limit(1))
+-        if doc is None:
+-            return False
+-        if doc.processing_attempts >= 3:
+-            doc.processing_status = "failed"
+-            doc.processing_error = "Maximum processing attempts reached"
++        relation_doc = await db.scalar(select(Document).where(
++            Document.processing_status == "relationship_extraction_pending",
++        ).order_by(Document.processing_started_at, Document.created_at).with_for_update(skip_locked=True).limit(1))
++        relation_doc_id = relation_doc.id if relation_doc is not None else None
++        if relation_doc_id is None:
++            doc = await db.scalar(select(Document).where(Document.processing_status == "queued").order_by(Document.created_at).with_for_update(skip_locked=True).limit(1))
++            if doc is None:
++                return False
++            if doc.processing_attempts >= 3:
++                doc.processing_status = "failed"
++                doc.processing_error = "Document processing reached the retry limit."
++                doc.processing_error_code = "retry_limit_exceeded"
++                doc.processing_error_retryable = False
++                doc.processing_completed_at = datetime.now(timezone.utc)
++                await db.commit()
++                return True
++            doc.processing_attempts += 1
++            doc.processing_status = "processing"
++            doc.processing_started_at = datetime.now(timezone.utc)
++            doc.processing_error = None
++            doc.processing_error_code = None
++            doc.processing_error_retryable = None
++            run_number = (await db.scalar(
++                select(func.max(ExtractionRun.run_number)).where(ExtractionRun.document_id == doc.id)
++            ) or 0) + 1
++            extraction_run = ExtractionRun(
++                document_id=doc.id,
++                run_number=run_number,
++                provider="paddleocr_ppstructurev3",
++                provider_version=None,
++                configuration={
++                    "engine": "PP-StructureV3",
++                    "layout_model": os.getenv("PADDLEOCR_LAYOUT_MODEL", "PP-DocLayout_plus-L"),
++                    "detection_model": os.getenv("PADDLEOCR_DET_MODEL", "PP-OCRv5_mobile_det"),
++                    "recognition_model": os.getenv("PADDLEOCR_REC_MODEL", "PP-OCRv5_mobile_rec"),
++                    "preprocessing": "engine_default",
++                    "fallback_engine": "unavailable",
++                },
++                status="processing",
++                started_at=doc.processing_started_at,
++            )
++            db.add(extraction_run)
++            await db.flush()
++            extraction_run_id = extraction_run.id
++            await append_audit(
++                db,
++                investigation_id=doc.investigation_id,
++                actor_user_id=None,
++                action="extraction.started",
++                target_type="extraction_run",
++                target_id=str(extraction_run.id),
++                details={"document_id": str(doc.id), "run_number": run_number},
++            )
++            print(f"Claimed document {doc.id} for OCR (attempt {doc.processing_attempts}/3)", flush=True)
+             await db.commit()
+-            return True
+-        doc.processing_attempts += 1
+-        doc.processing_status = "processing"
+-        doc.processing_started_at = datetime.now(timezone.utc)
+-        run_number = (await db.scalar(
+-            select(func.max(ExtractionRun.run_number)).where(ExtractionRun.document_id == doc.id)
+-        ) or 0) + 1
+-        extraction_run = ExtractionRun(
+-            document_id=doc.id,
+-            run_number=run_number,
+-            provider="paddleocr_ppstructurev3",
+-            provider_version=None,
+-            configuration={
+-                "engine": "PP-StructureV3",
+-                "layout_model": os.getenv("PADDLEOCR_LAYOUT_MODEL", "PP-DocLayout_plus-L"),
+-                "detection_model": os.getenv("PADDLEOCR_DET_MODEL", "PP-OCRv5_mobile_det"),
+-                "recognition_model": os.getenv("PADDLEOCR_REC_MODEL", "PP-OCRv5_mobile_rec"),
+-                "preprocessing": "engine_default",
+-                "fallback_engine": "unavailable",
+-            },
+-            status="processing",
+-            started_at=doc.processing_started_at,
+-        )
+-        db.add(extraction_run)
+-        await db.flush()
+-        extraction_run_id = extraction_run.id
+-        await append_audit(
+-            db,
+-            investigation_id=doc.investigation_id,
+-            actor_user_id=None,
+-            action="extraction.started",
+-            target_type="extraction_run",
+-            target_id=str(extraction_run.id),
+-            details={"document_id": str(doc.id), "run_number": run_number},
+-        )
+-        print(f"Claimed document {doc.id} for OCR (attempt {doc.processing_attempts}/3)", flush=True)
+-        await db.commit()
+-        storage_key = doc.storage_key
+-        doc_id = doc.id
++            storage_key = doc.storage_key
++            doc_id = doc.id
++        else:
++            doc_id = relation_doc_id
++            extraction_run_id = None
++    if extraction_run_id is None:
++        await _run_relationship_extraction(doc_id)
++        return True
+     try:
+         async with SessionLocal() as db:
+             source = await db.scalar(select(Document).where(Document.id == doc_id))
+@@ -299,6 +963,28 @@ async def process_one() -> bool:
+         raw, provider = _run_engine(path)
+         latency_ms = (time.perf_counter() - started) * 1000
+         source_blocks = _blocks(raw)
++        native_blocks = _native_pdf_blocks(path)
++        source_blocks.extend(native_blocks)
++        engine_raw = raw
++        page_metadata = engine_raw.get("page_metadata", []) if isinstance(engine_raw, dict) else []
++        page_count = len(page_metadata) if isinstance(page_metadata, list) else 0
++        if _is_pdf_file(path):
++            with fitz.open(path) as source_pdf:
++                page_count = source_pdf.page_count
++        elif not page_count:
++            page_count = max((block.get("page_index", -1) for block in source_blocks), default=-1) + 1
++        raw = {
++            "engine_output": engine_raw,
++            "page_metadata": page_metadata,
++            "native_pdf_text": native_blocks,
++            "extraction_coverage": {
++                "page_count": page_count,
++                "ocr_blocks": sum(block.get("extraction_method") == "ocr" for block in source_blocks),
++                "native_pdf_blocks": len(native_blocks),
++                "pages_with_native_text": len({block["page_index"] for block in native_blocks}),
++                "pages_with_ocr_text": len({block.get("page_index", 0) for block in source_blocks if block.get("extraction_method") == "ocr"}),
++            },
++        }
+         async with SessionLocal() as db:
+             current = await db.scalar(select(Document).where(Document.id == doc_id))
+             if current is None:
+@@ -317,6 +1003,15 @@ async def process_one() -> bool:
+                 for metadata in raw["page_metadata"]:
+                     if isinstance(metadata, dict) and isinstance(metadata.get("page_number"), int):
+                         page_metadata[metadata["page_number"] - 1] = metadata
++            for block in source_blocks:
++                page_index = block.get("page_index")
++                if not isinstance(page_index, int) or isinstance(page_index, bool) or page_index < 0:
++                    page_index = 0
++                metadata = page_metadata.get(page_index, {})
++                geometry = metadata.get("geometry") if isinstance(metadata, dict) else None
++                if isinstance(geometry, dict) and isinstance(block.get("engine_bbox"), (list, dict)):
++                    block["bbox_space"] = metadata.get("bbox_space")
++                    block["page_geometry"] = geometry
+             page_records: dict[int, EvidencePage] = {}
+             page_indexes = sorted(set(page_blocks) | set(page_metadata))
+             for page_index in page_indexes:
+@@ -328,7 +1023,7 @@ async def process_one() -> bool:
+                     page_number=page_index + 1,
+                     width=metadata.get("width"),
+                     height=metadata.get("height"),
+-                    text="\n".join(block["text"] for block in blocks),
++                    text=_logical_text(blocks),
+                 )
+                 db.add(page)
+                 page_records[page_index] = page
+@@ -345,10 +1040,13 @@ async def process_one() -> bool:
+                     text=block["text"],
+                     bounding_box=block.get("engine_bbox"),
+                     confidence=block.get("engine_confidence"),
++                    extraction_method=block.get("extraction_method", "ocr"),
++                    coordinate_space=block.get("bbox_space") or ("ocr_pixels" if block.get("engine_bbox") is not None else None),
++                    source_sha256=current.sha256,
+                     source_reference=str(block.get("source_path") or block["block_id"]),
+                 ))
+             record = await db.scalar(select(OCRResult).where(OCRResult.document_id == doc_id))
+-            fields = dict(provider="paddleocr_ppstructurev3", provider_version=provider, raw_result=raw, blocks=source_blocks, recognized_text="\n".join(b["text"] for b in source_blocks))
++            fields = dict(provider="paddleocr_ppstructurev3", provider_version=provider, raw_result=raw, blocks=source_blocks, recognized_text=_logical_text(source_blocks))
+             if record:
+                 for key, value in fields.items():
+                     setattr(record, key, value)
+@@ -359,9 +1057,15 @@ async def process_one() -> bool:
+             extraction.latency_ms = latency_ms
+             extraction.status = "completed"
+             extraction.completed_at = datetime.now(timezone.utc)
+-            current.processing_status = "ocr_completed"
++            current.processing_status = "relationship_extraction_pending" if settings.relationship_extraction_enabled else "ocr_completed"
+             current.processing_error = None
+-            current.processing_completed_at = datetime.now(timezone.utc)
++            current.processing_error_code = None
++            current.processing_error_retryable = None
++            if settings.relationship_extraction_enabled:
++                current.processing_started_at = datetime.now(timezone.utc)
++                current.processing_completed_at = None
++            else:
++                current.processing_completed_at = datetime.now(timezone.utc)
+             await append_audit(
+                 db,
+                 investigation_id=current.investigation_id,
+@@ -378,58 +1082,15 @@ async def process_one() -> bool:
+         print(f"Document {doc_id} OCR failed: {str(exc)[:300]}", flush=True)
+         return True
+ 
+-    if not settings.relationship_extraction_enabled:
+-        return True
+-    async with SessionLocal() as db:
+-        current = await db.scalar(select(Document).where(Document.id == doc_id))
+-        if current is None:
+-            return True
+-        current.processing_status = "relationship_extraction_pending"
+-        await db.commit()
+-    try:
+-        from app.services.relationship_extraction import extract
+-        graph, metadata = extract(source_blocks)
+-        graph["usage"] = metadata.get("usage", [])
+-        async with SessionLocal() as db:
+-            current = await db.scalar(select(Document).where(Document.id == doc_id))
+-            if current:
+-                record = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == doc_id))
+-                values = {"model": settings.xai_model, "payload": graph}
+-                if record:
+-                    record.model = values["model"]
+-                    record.payload = values["payload"]
+-                else:
+-                    db.add(RelationshipAnalysis(document_id=doc_id, **values))
+-                current.processing_status = "relationship_extraction_completed"
+-                current.processing_error = None
+-                current.processing_completed_at = datetime.now(timezone.utc)
+-                await append_audit(
+-                    db,
+-                    investigation_id=current.investigation_id,
+-                    actor_user_id=None,
+-                    action="relationship_extraction.completed",
+-                    target_type="document",
+-                    target_id=str(current.id),
+-                    details={"model": settings.xai_model},
+-                )
+-                await db.commit()
+-        print(f"Relationship extraction completed for document {doc_id}", flush=True)
+-    except Exception as exc:
+-        async with SessionLocal() as db:
+-            current = await db.scalar(select(Document).where(Document.id == doc_id))
+-            if current:
+-                current.processing_status = "relationship_extraction_failed"
+-                current.processing_error = str(exc)[:500]
+-                current.processing_completed_at = datetime.now(timezone.utc)
+-                await append_audit(
+-                    db,
+-                    investigation_id=current.investigation_id,
+-                    actor_user_id=None,
+-                    action="relationship_extraction.failed",
+-                    target_type="document",
+-                    target_id=str(current.id),
+-                    details={"error": str(exc)[:300]},
+-                )
+-                await db.commit()
+-        print(f"Document {doc_id} relationship extraction failed: {str(exc)[:300]}", flush=True)
++    if settings.relationship_extraction_enabled:
++        await _run_relationship_extraction(doc_id)
++    else:
++        try:
++            await _persist_deterministic_evidence(doc_id)
++        except Exception as exc:
++            print(
++                f"Deterministic relationship analysis failed for document {doc_id} "
++                f"(exception_type={type(exc).__name__})",
++                flush=True,
++            )
+     return True
+diff --git a/backend/tests/test_document_processing.py b/backend/tests/test_document_processing.py
+index fb9ee56..ce5260a 100644
+--- a/backend/tests/test_document_processing.py
++++ b/backend/tests/test_document_processing.py
+@@ -1,6 +1,11 @@
+ from dataclasses import replace
+ import hashlib
++import io
++import json
++import uuid
++from datetime import datetime, timezone
+ from pathlib import Path
++import shutil
+ 
+ import pytest
+ 
+@@ -8,15 +13,136 @@ from app.api.v1 import analysis as analysis_routes, auth as auth_routes, investi
+ from app.core.config import settings
+ from app.main import app
+ from app.services.ocr_worker import _blocks
+-from app.services import ocr_worker, relationship_extraction
++from app.services import audit_chain, ocr_worker, relationship_extraction
++from app.services.llm_client import LLMHTTPError
+ from app.services.relationship_extraction import EntityMention
+ from pydantic import ValidationError
+ from scripts import paddle_service
++import fitz
++
++
++@pytest.mark.asyncio
++async def test_audit_append_order_remains_stable_when_clock_values_tie(client, monkeypatch):
++    from sqlalchemy import select
++
++    from app.models.entities import AuditChainEvent
++
++    monkeypatch.setattr(auth_routes, "settings", replace(settings, self_registration_enabled=True))
++    await client.post("/api/v1/auth/register", json={
++        "full_name": "Audit Timing Test", "email": "audit-timing@example.com", "password": "StrongPassword123",
++    })
++    case = await client.post(
++        "/api/v1/investigations",
++        headers={"X-CSRF-Token": client.cookies.get("dfi_csrf")},
++        json={"title": "Audit timestamp ordering"},
++    )
++    investigation_id = uuid.UUID(case.json()["id"])
++    fixed_time = datetime(2099, 1, 1, tzinfo=timezone.utc)
++
++    class FixedClock:
++        @staticmethod
++        def now(_tz=None):
++            return fixed_time
++
++    monkeypatch.setattr(audit_chain, "datetime", FixedClock)
++    async with app.state.test_sessions() as db:
++        await audit_chain.append_audit(
++            db, investigation_id=investigation_id, actor_user_id=None,
++            action="test.first", target_type="test", target_id="one",
++        )
++        await db.flush()
++        await audit_chain.append_audit(
++            db, investigation_id=investigation_id, actor_user_id=None,
++            action="test.second", target_type="test", target_id="two",
++        )
++        await db.commit()
++        rows = (await db.scalars(
++            select(AuditChainEvent)
++            .where(AuditChainEvent.investigation_id == investigation_id)
++            .order_by(AuditChainEvent.created_at.asc(), AuditChainEvent.id.asc())
++        )).all()
++
++    actions = [row.action for row in rows]
++    assert actions[-2:] == ["test.first", "test.second"]
++    assert rows[-2].created_at < rows[-1].created_at
++    from app.services.audit_chain import verify_audit_chain
++    assert verify_audit_chain(rows)["valid"] is True
++
++
++def test_relationship_extraction_requires_configured_cloudflare_token(monkeypatch):
++    monkeypatch.setattr(relationship_extraction, "settings", replace(
++        settings, llm_api_key="",
++    ))
++
++    with pytest.raises(RuntimeError, match="CLOUDFLARE_API_TOKEN is not configured"):
++        relationship_extraction.extract([{"block_id": "synthetic-b1", "text": "Synthetic test text"}])
++
++
++def test_relationship_extraction_sanitizes_cloudflare_auth_failure(monkeypatch):
++    monkeypatch.setattr(relationship_extraction, "settings", replace(
++        settings,
++        llm_api_key="synthetic-test-token",
++        llm_base_url="https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1",
++        llm_model="@cf/zai-org/glm-4.7-flash",
++    ))
++
++    def unauthorized(_messages, **_kwargs):
++        raise LLMHTTPError(401)
++
++    monkeypatch.setattr(relationship_extraction, "chat_completion", unauthorized)
++    with pytest.raises(relationship_extraction.RelationshipExtractionError, match="authentication failed; verify token") as exc:
++        relationship_extraction.extract([{"block_id": "synthetic-b1", "text": "Synthetic test text"}])
++    assert exc.value.code == "provider_authentication_error"
++    assert exc.value.retryable is False
++    assert "synthetic-test-token" not in str(exc.value)
+ 
+ 
+ PASSWORD = "StrongPassword123"
+ 
+ 
++def test_pdf_ocr_rasterization_persists_measured_pixel_to_page_mapping(tmp_path):
++    source = tmp_path / "source.pdf"
++    document = fitz.open()
++    page = document.new_page(width=612, height=792)
++    page.insert_text((72, 72), "Coordinates")
++    document.save(source)
++    document.close()
++
++    raster_dir, temporary_dir, pages = paddle_service._render_pdf_pages(str(source), dpi=144)
++
++    assert raster_dir == temporary_dir
++    assert len(pages) == 1
++    assert pages[0]["bbox_space"] == "rendered_pixels_top_left"
++    assert pages[0]["geometry"]["render_width_px"] == pages[0]["width"]
++    assert pages[0]["geometry"]["render_height_px"] == pages[0]["height"]
++    assert pages[0]["geometry"]["page_width_points"] == 612
++    assert pages[0]["geometry"]["page_height_points"] == 792
++    shutil.rmtree(temporary_dir)
++
++
++def test_pdf_ocr_rasterization_rejects_empty_documents(tmp_path):
++    source = tmp_path / "empty.pdf"
++    from pypdf import PdfWriter
++    PdfWriter().write(source)
++
++    with pytest.raises(ValueError, match="PDF contains no pages"):
++        paddle_service._render_pdf_pages(str(source))
++
++
++def test_ocr_temporary_cleanup_removes_render_directories_and_files(tmp_path):
++    directory = tmp_path / "rendered-pages"
++    directory.mkdir()
++    (directory / "page-0001.png").write_bytes(b"synthetic")
++    temporary_file = tmp_path / "input.png"
++    temporary_file.write_bytes(b"synthetic")
++
++    paddle_service._cleanup_temporary(str(directory))
++    paddle_service._cleanup_temporary(str(temporary_file))
++
++    assert not directory.exists()
++    assert not temporary_file.exists()
++
++
+ @pytest.mark.asyncio
+ async def test_image_upload_is_persisted_and_scoped_to_owned_investigation(client, monkeypatch, tmp_path):
+     monkeypatch.setattr(auth_routes, "settings", replace(settings, self_registration_enabled=True))
+@@ -104,11 +230,241 @@ async def test_integrity_endpoint_verifies_stored_bytes(client, monkeypatch, tmp
+ @pytest.mark.asyncio
+ async def test_worker_persists_immutable_extraction_run_pages_and_spans(client, monkeypatch, tmp_path):
+     auth_routes._attempts.clear()
++
++
++@pytest.mark.asyncio
++async def test_relationship_only_retry_reuses_persisted_ocr(client, monkeypatch, tmp_path):
++    from sqlalchemy import select, func
++
++    from app.models.entities import Document, ExtractionRun, OCRResult
++
++    auth_routes._attempts.clear()
++
++
++@pytest.mark.asyncio
++async def test_partial_relationship_chunks_persist_and_retry_only_missing_chunk(client, monkeypatch, tmp_path):
++    from sqlalchemy import select, func
++
++    from app.models.entities import Document, ExtractionRun, OCRResult, RelationshipAnalysis
++
++    auth_routes._attempts.clear()
++    monkeypatch.setattr(auth_routes, "settings", replace(settings, self_registration_enabled=True))
++    monkeypatch.setattr(investigation_routes, "settings", replace(settings, document_storage_path=str(tmp_path)))
++    monkeypatch.setattr(ocr_worker, "settings", replace(
++        settings, document_storage_path=str(tmp_path), relationship_extraction_enabled=True,
++        llm_model="synthetic-model", llm_relationship_chunk_characters=1000,
++        llm_relationship_chunk_overlap=0,
++    ))
++    monkeypatch.setattr(ocr_worker, "SessionLocal", app.state.test_sessions)
++    monkeypatch.setattr(relationship_extraction, "settings", replace(
++        settings, llm_api_key="synthetic-token", llm_model="synthetic-model",
++        llm_relationship_chunk_characters=1000, llm_relationship_chunk_overlap=0,
++    ))
++    monkeypatch.setattr(
++        ocr_worker, "_run_engine",
++        lambda _path: ({"page_metadata": [], "engine_output": [
++                {"page_index": 0, "parsing_res_list": [{"text": "Entity Alpha Account Alpha " + "a" * 680, "block_id": "engine-a"}]},
++                {"page_index": 1, "parsing_res_list": [{"text": "Entity Beta Account Beta " + "b" * 680, "block_id": "engine-b"}]},
++        ]}, "test-engine"),
++    )
++    provider_calls = {"block_000001": 0, "block_000002": 0}
++    fail_second_chunk = {"value": True}
++
++    def provider(messages, **_kwargs):
++        supplied = json.loads(messages[1]["content"])
++        block = supplied[0]
++        block_id = block["block_id"]
++        provider_calls[block_id] += 1
++        if block_id == "block_000002" and fail_second_chunk["value"]:
++            raise relationship_extraction.LLMHTTPError(503)
++        suffix = "Alpha" if block_id == "block_000001" else "Beta"
++        return {
++            "content": json.dumps({
++                "schema_version": "relationship_extraction_v1",
++                "entities": [
++                    {"mention_id": "m1", "entity_type": "PERSON", "mention_text": f"Entity {suffix}", "source_block_ids": [block_id], "confidence": 0.9},
++                    {"mention_id": "m2", "entity_type": "ACCOUNT", "mention_text": f"Account {suffix}", "source_block_ids": [block_id], "confidence": 0.8},
++                ],
++                "relationships": [{"relationship_id": "r1", "subject_mention_id": "m1", "predicate": "ASSOCIATED_WITH",
++                                   "object_mention_id": "m2", "relationship_kind": "explicit",
++                                   "source_block_ids": [block_id], "confidence": 0.85}],
++            }),
++            "usage": {"total_tokens": 8},
++        }
++
++    monkeypatch.setattr(relationship_extraction, "chat_completion", provider)
++    await client.post("/api/v1/auth/register", json={"full_name": "Chunk Retry", "email": "chunk-retry@example.com", "password": PASSWORD})
++    headers = {"X-CSRF-Token": client.cookies.get("dfi_csrf")}
++    case = await client.post("/api/v1/investigations", headers=headers, json={"title": "Partial relationship run"})
++    uploaded = await client.post(
++        f"/api/v1/investigations/{case.json()['id']}/documents",
++        headers={**headers, "X-File-Name": "multi-page.png", "Content-Type": "image/png"},
++        content=b"\x89PNG\r\n\x1a\nsource",
++    )
++    document_id = uuid.UUID(uploaded.json()["id"])
++    assert await ocr_worker.process_one()
++
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        ocr = await db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
++        partial = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == document_id))
++        run_count = await db.scalar(select(func.count(ExtractionRun.id)).where(ExtractionRun.document_id == document_id))
++        assert doc.processing_status == "relationship_extraction_failed"
++        assert doc.processing_error_code == "provider_temporarily_unavailable"
++        assert ocr.recognized_text
++        assert len(partial.payload["chunks"]) == 1
++        assert len(partial.payload["entities"]) == 2
++        assert partial.payload["entities"][0]["source_references"][0]["block_id"] == "block_000001"
++        assert len(partial.payload["relationships"]) == 1
++        assert partial.payload["relationships"][0]["source_references"]
++        assert run_count == 1
++
++    assert provider_calls == {"block_000001": 1, "block_000002": 3}
++    retry = await client.post(
++        f"/api/v1/investigations/{case.json()['id']}/documents/{document_id}/retry", headers=headers,
++    )
++    assert retry.status_code == 202
++    fail_second_chunk["value"] = False
++    assert await ocr_worker.process_one()
++
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        ocr = await db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
++        final = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == document_id))
++        run_count = await db.scalar(select(func.count(ExtractionRun.id)).where(ExtractionRun.document_id == document_id))
++        assert doc.processing_status == "relationship_extraction_completed"
++        assert doc.processing_attempts == 1
++        assert doc.relationship_extraction_attempts == 2
++        assert {entity["mention_text"] for entity in final.payload["entities"]} == {"Entity Alpha", "Account Alpha", "Entity Beta", "Account Beta"}
++        assert all(entity["source_references"] for entity in final.payload["entities"])
++        assert len(final.payload["relationships"]) == 2
++        assert all(relation["source_references"] for relation in final.payload["relationships"])
++        assert run_count == 1
++        assert ocr.recognized_text
++        assert final.payload["run"]["cache_key"]
++        assert final.payload["run"]["pipeline_version"] == relationship_extraction.EXTRACTION_PIPELINE_VERSION
++        assert final.payload["run"]["stage_timings_ms"]["database_checkpoint_persistence_ms"] >= 0
++    assert provider_calls == {"block_000001": 1, "block_000002": 4}
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        doc.processing_status = "relationship_extraction_pending"
++        await db.commit()
++    assert await ocr_worker.process_one()
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        assert doc.processing_status == "relationship_extraction_completed"
++        assert doc.relationship_extraction_attempts == 2
++    assert provider_calls == {"block_000001": 1, "block_000002": 4}
++    auth_routes._attempts.clear()
++
++
++@pytest.mark.asyncio
++async def test_relationship_checkpoint_persistence_failure_is_retryable_without_ocr_rerun(client, monkeypatch, tmp_path):
++    from sqlalchemy import select, func
++
++    from app.models.entities import Document, ExtractionRun, OCRResult
++
++    auth_routes._attempts.clear()
++    monkeypatch.setattr(auth_routes, "settings", replace(settings, self_registration_enabled=True))
++    monkeypatch.setattr(investigation_routes, "settings", replace(settings, document_storage_path=str(tmp_path)))
++    monkeypatch.setattr(ocr_worker, "settings", replace(settings, document_storage_path=str(tmp_path), relationship_extraction_enabled=True))
++    monkeypatch.setattr(ocr_worker, "SessionLocal", app.state.test_sessions)
++    monkeypatch.setattr(relationship_extraction, "settings", replace(settings, llm_api_key="synthetic-token", llm_model="synthetic-model"))
++    monkeypatch.setattr(ocr_worker, "_run_engine", lambda _path: ({"page_metadata": [], "engine_output": [{"page_index": 0, "parsing_res_list": [{"text": "Synthetic Person", "block_id": "engine-a"}]}]}, "test-engine"))
++    monkeypatch.setattr(relationship_extraction, "chat_completion", lambda *_args, **_kwargs: {
++        "content": json.dumps({"schema_version": "relationship_extraction_v1", "entities": [
++            {"mention_id": "m1", "entity_type": "PERSON", "mention_text": "Synthetic Person", "source_block_ids": ["block_000001"], "confidence": None},
++        ], "relationships": []}),
++    })
++    real_persist = ocr_worker._persist_relationship_chunk
++
++    async def fail_checkpoint(*_args, **_kwargs):
++        raise OSError("synthetic database write failure")
++
++    monkeypatch.setattr(ocr_worker, "_persist_relationship_chunk", fail_checkpoint)
++    await client.post("/api/v1/auth/register", json={"full_name": "Checkpoint Failure", "email": "checkpoint-failure@example.com", "password": PASSWORD})
++    headers = {"X-CSRF-Token": client.cookies.get("dfi_csrf")}
++    case = await client.post("/api/v1/investigations", headers=headers, json={"title": "Checkpoint persistence"})
++    uploaded = await client.post(
++        f"/api/v1/investigations/{case.json()['id']}/documents",
++        headers={**headers, "X-File-Name": "evidence.png", "Content-Type": "image/png"},
++        content=b"\x89PNG\r\n\x1a\nsource",
++    )
++    document_id = uuid.UUID(uploaded.json()["id"])
++    assert await ocr_worker.process_one()
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        ocr = await db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
++        assert doc.processing_status == "relationship_extraction_failed"
++        assert doc.processing_error_code == "relationship_persistence_failed"
++        assert doc.processing_error_retryable is True
++        assert ocr.recognized_text == "Synthetic Person"
++
++    monkeypatch.setattr(ocr_worker, "_persist_relationship_chunk", real_persist)
++    retry = await client.post(f"/api/v1/investigations/{case.json()['id']}/documents/{document_id}/retry", headers=headers)
++    assert retry.status_code == 202
++    assert await ocr_worker.process_one()
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        ocr = await db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
++        run_count = await db.scalar(select(func.count(ExtractionRun.id)).where(ExtractionRun.document_id == document_id))
++        assert doc.processing_status == "relationship_extraction_completed"
++        assert doc.processing_attempts == 1
++        assert doc.relationship_extraction_attempts == 2
++        assert ocr.recognized_text == "Synthetic Person"
++        assert run_count == 1
++    auth_routes._attempts.clear()
++    monkeypatch.setattr(auth_routes, "settings", replace(settings, self_registration_enabled=True))
++    monkeypatch.setattr(investigation_routes, "settings", replace(settings, document_storage_path=str(tmp_path)))
++    monkeypatch.setattr(ocr_worker, "settings", replace(settings, document_storage_path=str(tmp_path), relationship_extraction_enabled=True))
++    monkeypatch.setattr(ocr_worker, "SessionLocal", app.state.test_sessions)
++    model_calls = []
++    monkeypatch.setattr(relationship_extraction, "extract", lambda blocks, **_kwargs: (model_calls.append(blocks) or {"schema_version": "relationship_extraction_v1", "entities": [], "relationships": [], "chunks": []}, {"usage": []}))
++    monkeypatch.setattr(ocr_worker, "_run_engine", lambda _path: ({"page_metadata": [], "engine_output": [{"page_index": 0, "parsing_res_list": [{"text": "Stored OCR evidence", "block_id": "source-1"}]}]}, "test-engine"))
++    await client.post("/api/v1/auth/register", json={"full_name": "Retry Test", "email": "retry-relation@example.com", "password": PASSWORD})
++    headers = {"X-CSRF-Token": client.cookies.get("dfi_csrf")}
++    case = await client.post("/api/v1/investigations", headers=headers, json={"title": "Relationship retry"})
++    uploaded = await client.post(
++        f"/api/v1/investigations/{case.json()['id']}/documents",
++        headers={**headers, "X-File-Name": "evidence.png", "Content-Type": "image/png"},
++        content=b"\x89PNG\r\n\x1a\nsource",
++    )
++    document_id = uuid.UUID(uploaded.json()["id"])
++    assert await ocr_worker.process_one()
++    assert len(model_calls) == 1
++
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        doc.processing_status = "relationship_extraction_failed"
++        doc.processing_error = "Safe synthetic failure"
++        doc.processing_error_code = "invalid_model_output"
++        doc.processing_error_retryable = True
++        await db.commit()
++
++    retry_response = await client.post(
++        f"/api/v1/investigations/{case.json()['id']}/documents/{document_id}/retry",
++        headers=headers,
++    )
++    assert retry_response.status_code == 202
++    assert retry_response.json()["status"] == "relationship_extraction_pending"
++    assert await ocr_worker.process_one()
++    assert len(model_calls) == 2
++
++    async with app.state.test_sessions() as db:
++        doc = await db.scalar(select(Document).where(Document.id == document_id))
++        ocr_result = await db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
++        run_count = await db.scalar(select(func.count(ExtractionRun.id)).where(ExtractionRun.document_id == document_id))
++        assert doc.processing_status == "relationship_extraction_completed"
++        assert doc.processing_attempts == 1
++        assert doc.relationship_extraction_attempts == 2
++        assert ocr_result.recognized_text == "Stored OCR evidence"
++        assert run_count == 1
++    auth_routes._attempts.clear()
+     monkeypatch.setattr(auth_routes, "settings", replace(settings, self_registration_enabled=True))
+     monkeypatch.setattr(investigation_routes, "settings", replace(settings, document_storage_path=str(tmp_path)))
+     monkeypatch.setattr(ocr_worker, "settings", replace(settings, document_storage_path=str(tmp_path)))
+     monkeypatch.setattr(ocr_worker, "SessionLocal", app.state.test_sessions)
+-    monkeypatch.setattr(relationship_extraction, "extract", lambda _blocks: ({"schema_version": "relationship_extraction_v1", "entities": [], "relationships": []}, {"usage": []}))
++    monkeypatch.setattr(relationship_extraction, "extract", lambda _blocks, **_kwargs: ({"schema_version": "relationship_extraction_v1", "entities": [], "relationships": [], "chunks": []}, {"usage": []}))
+     monkeypatch.setattr(
+         ocr_worker,
+         "_run_engine",
+@@ -144,7 +500,7 @@ async def test_worker_persists_immutable_extraction_run_pages_and_spans(client,
+     assert span["bounding_box"] == [3, 5, 120, 25]
+     assert span["confidence"] == 0.94
+     audit_actions = [item["action"] for item in (await client.get(f"/api/v1/investigations/{case.json()['id']}/audit")).json()["items"]]
+-    assert audit_actions[-2:] == ["extraction.completed", "relationship_extraction.completed"]
++    assert audit_actions[-3:] == ["extraction.completed", "relationship_extraction.started", "relationship_extraction.completed"]
+     auth_routes._attempts.clear()
+ 
+ 
+@@ -166,7 +522,7 @@ async def test_upload_rejects_mismatched_content_and_cleans_partial_file(client,
+ def test_ocr_block_adapter_keeps_source_paths_and_engine_fields():
+     raw = [{"page_index": 2, "parsing_res_list": [{"block_id": "blk-7", "text": "ACME Ltd", "bbox": [1, 2, 3, 4], "confidence": 0.91}]}]
+     blocks = _blocks(raw)
+-    assert blocks == [{"block_id": "block_000001", "source_path": "root[0].parsing_res_list[0]", "text": "ACME Ltd", "page_index": 2, "engine_block_id": "blk-7", "engine_bbox": [1, 2, 3, 4], "engine_confidence": 0.91}]
++    assert blocks == [{"block_id": "block_000001", "source_path": "root[0].parsing_res_list[0]", "text": "ACME Ltd", "extraction_method": "ocr", "page_index": 2, "engine_block_id": "blk-7", "engine_bbox": [1, 2, 3, 4], "engine_confidence": 0.91}]
+ 
+ 
+ def test_ocr_block_adapter_reads_ppstructure_payload():
+@@ -175,7 +531,7 @@ def test_ocr_block_adapter_reads_ppstructure_payload():
+         {"block_label": "image", "block_content": "", "block_bbox": [0, 0, 1, 1], "block_id": 1, "block_order": None},
+     ]}}]
+     blocks = _blocks(raw)
+-    assert blocks == [{"block_id": "block_000001", "source_path": "root[0].res.parsing_res_list[0]", "text": "ACME Ltd", "engine_block_id": 0, "engine_bbox": [1, 2, 3, 4], "engine_label": "doc_title"}]
++    assert blocks == [{"block_id": "block_000001", "source_path": "root[0].res.parsing_res_list[0]", "text": "ACME Ltd", "extraction_method": "ocr", "engine_block_id": 0, "engine_bbox": [1, 2, 3, 4], "engine_label": "doc_title"}]
+ 
+ 
+ def test_ocr_block_adapter_falls_back_to_recognized_lines():
+@@ -224,3 +580,69 @@ def test_entity_schema_rejects_unsupported_types_and_extra_fields():
+         EntityMention(**base, entity_type="FRAUD")
+     with pytest.raises(ValidationError):
+         EntityMention(**base, entity_type="PERSON", unsupported="value")
++
++
++@pytest.mark.asyncio
++async def test_deterministic_candidates_are_committed_before_ai_failure(client, monkeypatch):
++    from sqlalchemy import select
++
++    from app.models.entities import Document, OCRResult, RelationshipAnalysis
++
++    auth_routes._attempts.clear()
++    monkeypatch.setattr(auth_routes, "settings", replace(settings, self_registration_enabled=True))
++    monkeypatch.setattr(ocr_worker, "settings", replace(settings, relationship_extraction_enabled=True))
++    monkeypatch.setattr(ocr_worker, "SessionLocal", app.state.test_sessions)
++    monkeypatch.setattr(relationship_extraction, "settings", replace(settings, llm_model="test-model"))
++    await client.post("/api/v1/auth/register", json={
++        "full_name": "Deterministic Stage Test", "email": "deterministic-stage@example.com", "password": PASSWORD,
++    })
++    headers = {"X-CSRF-Token": client.cookies.get("dfi_csrf")}
++    case = await client.post("/api/v1/investigations", headers=headers, json={"title": "Deterministic stage isolation"})
++    investigation_id = uuid.UUID(case.json()["id"])
++    current_id = uuid.uuid4()
++    shared_email = "shared-identity@example.test"
++    async with app.state.test_sessions() as db:
++        for index, document_id in enumerate((uuid.uuid4(), current_id)):
++            document = Document(
++                id=document_id, investigation_id=investigation_id, filename=f"source-{index}.pdf",
++                content_type="application/pdf", size_bytes=1, storage_key=uuid.uuid4().hex,
++                sha256=hashlib.sha256(f"source-{index}".encode()).hexdigest(),
++                processing_status="relationship_extraction_pending" if document_id == current_id else "ocr_completed",
++            )
++            db.add(document)
++            db.add(OCRResult(
++                document_id=document_id, provider="test", provider_version="1", raw_result={},
++                recognized_text=f"Email: {shared_email}",
++                blocks=[{"block_id": f"email-{index}", "page_index": index, "extraction_method": "native_pdf_text", "text": f"Email: {shared_email}"}],
++            ))
++        await db.commit()
++
++    def fail_ai(*_args, **_kwargs):
++        raise relationship_extraction.RelationshipExtractionError(
++            "invalid_model_output", "Synthetic invalid response", retryable=False,
++        )
++
++    monkeypatch.setattr(relationship_extraction, "extract", fail_ai)
++    await ocr_worker._run_relationship_extraction(current_id)
++
++    async with app.state.test_sessions() as db:
++        document = await db.scalar(select(Document).where(Document.id == current_id))
++        relationship = await db.scalar(select(RelationshipAnalysis).where(RelationshipAnalysis.document_id == current_id))
++        assert document.processing_status == "relationship_extraction_failed"
++        assert relationship.payload["analysis_stages"] == {
++            "source_extraction": "completed", "deterministic_evidence": "completed",
++            "investigation_correlation": "completed", "ai_enrichment": "failed",
++            "investigator_review": "pending",
++        }
++        assert relationship.payload["deterministic_analysis"]["entity_count"] == 1
++        assert relationship.payload["deterministic_analysis"]["relationship_candidate_count"] == 1
++        candidate = relationship.payload["deterministic_analysis"]["relationship_candidates"][0]
++        assert str(document.id) in {ref["document_id"] for ref in candidate["evidence_refs"]}
++        assert len({ref["document_id"] for ref in candidate["evidence_refs"]}) == 2
++        assert all(ref["block_id"] and ref["quoted_text"] and ref["source_sha256"] for ref in candidate["evidence_refs"])
++
++    documents_response = await client.get(f"/api/v1/investigations/{investigation_id}/documents")
++    current_response = next(item for item in documents_response.json() if item["id"] == str(current_id))
++    assert current_response["analysis_stages"]["deterministic_evidence"] == "completed"
++    assert current_response["analysis_stages"]["ai_enrichment"] == "failed"
++    auth_routes._attempts.clear()
+diff --git a/frontend/DocForensIQ-frontend/src/pages/WorkspacePages.tsx b/frontend/DocForensIQ-frontend/src/pages/WorkspacePages.tsx
+index a17221f..1aa9d46 100644
+--- a/frontend/DocForensIQ-frontend/src/pages/WorkspacePages.tsx
++++ b/frontend/DocForensIQ-frontend/src/pages/WorkspacePages.tsx
+@@ -158,7 +158,7 @@ function QueryError({ onRetry }: { onRetry: () => void }) {
+ function StatusBadge({ value }: { value: string }) {
+   const color = ['completed', 'ocr_completed', 'relationship_extraction_completed'].includes(value) ? 'green'
+     : ['failed', 'relationship_extraction_failed'].includes(value) ? 'red'
+-      : ['processing', 'relationship_extraction_pending'].includes(value) ? 'amber'
++      : ['processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(value) ? 'amber'
+         : value === 'queued' ? 'blue'
+           : value === 'in_review' ? 'amber' : value === 'archived' ? 'neutral' : 'blue';
+   const labels: Record<string, string> = {
+@@ -166,6 +166,7 @@ function StatusBadge({ value }: { value: string }) {
+     processing: 'OCR in progress',
+     ocr_completed: 'OCR complete',
+     relationship_extraction_pending: 'Finding relationships',
++    relationship_extraction_processing: 'Finding relationships',
+     relationship_extraction_completed: 'Analysis complete',
+     relationship_extraction_failed: 'Relationship analysis failed',
+     completed: 'Complete',
+@@ -309,7 +310,7 @@ export function NewInvestigationPage() {
+   </section>;
+ }
+ 
+-type DocumentItem = RelationshipDocument & { attempts_remaining: number; source_description?: string | null; uploaded_by_user_id?: string | null };
++type DocumentItem = RelationshipDocument & { attempts_remaining: number; processing_error?: string | null; processing_error_code?: string | null; processing_error_retryable?: boolean | null; relationship_extraction_attempts?: number; analysis_stages?: Record<string, string>; source_description?: string | null; uploaded_by_user_id?: string | null };
+ type GraphResponse = {
+   nodes: RelationshipEntity[];
+   edges: RelationshipClaim[];
+@@ -317,9 +318,9 @@ type GraphResponse = {
+   graph_edges?: ApiGraphEdge[];
+   meta: { investigation_id: string; graph_version: string };
+ };
+-type OCRResponse = { document_id: string; provider: string; provider_version: string | null; recognized_text: string; blocks: { block_id: string; source_path: string; text: string; page_index?: number; engine_bbox?: unknown; engine_confidence?: number }[]; raw_result?: unknown };
++type OCRResponse = { document_id: string; provider: string; provider_version: string | null; recognized_text: string; extraction_coverage?: { page_count?: number; ocr_blocks?: number; native_pdf_blocks?: number; pages_with_native_text?: number; pages_with_ocr_text?: number; status?: string; reason?: string }; blocks: { block_id: string; source_path: string; text: string; page_index?: number; engine_bbox?: unknown; engine_confidence?: number | null; extraction_method?: string; bbox_space?: string; table_structure_status?: string; cells?: Array<{ header?: string | null; raw_text: string; column_index: number; bbox?: unknown }> }[]; raw_result?: unknown };
+ type ExtractionRun = { id: string; run_number: number; provider: string; provider_version: string | null; configuration: Record<string, unknown>; status: string; error_detail: string | null; latency_ms: number | null; started_at: string | null; completed_at: string | null };
+-type ExtractionDetail = ExtractionRun & { pages: Array<{ id: string; page_number: number; width: number | null; height: number | null; text: string }>; spans: Array<{ id: string; page_id: string | null; block_id: string; text: string; bounding_box: unknown; confidence: number | null; source_reference: string }> };
++type ExtractionDetail = ExtractionRun & { pages: Array<{ id: string; page_number: number; width: number | null; height: number | null; text: string }>; spans: Array<{ id: string; page_id: string | null; block_id: string; text: string; bounding_box: unknown; confidence: number | null; extraction_method: string; coordinate_space: string | null; source_sha256: string | null; source_reference: string }> };
+ 
+ function boundingRect(value: unknown): { left: number; top: number; width: number; height: number } | null {
+   if (!Array.isArray(value)) return null;
+@@ -402,17 +403,17 @@ export function InvestigationUnavailable() {
+     queryFn: () => apiRequest<DocumentItem[]>(`/investigations/${investigationId}/documents`),
+     enabled: Boolean(investigationId),
+     refetchInterval: (query) => Array.isArray(query.state.data) && query.state.data.some((doc) =>
+-      ['queued', 'processing', 'relationship_extraction_pending'].includes(doc.processing_status)) ? 2500 : false,
++      ['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(doc.processing_status)) ? 2500 : false,
+   });
+   const documentItems = useMemo(() => Array.isArray(documents.data) ? documents.data : [], [documents.data]);
+   const filteredDocuments = useMemo(() => documentItems.filter((doc) =>
+     (!documentStatusFilter || doc.processing_status === documentStatusFilter)
+     && (!documentSearch.trim() || `${doc.filename} ${doc.sha256 ?? ''} ${doc.source_description ?? ''}`.toLocaleLowerCase().includes(documentSearch.trim().toLocaleLowerCase())),
+   ), [documentItems, documentSearch, documentStatusFilter]);
+-  const inProgressCount = documentItems.filter((doc) => ['queued', 'processing', 'relationship_extraction_pending'].includes(doc.processing_status)).length;
++  const inProgressCount = documentItems.filter((doc) => ['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(doc.processing_status)).length;
+   const waitingCount = documentItems.filter((doc) => doc.processing_status === 'queued').length;
+   const selectedDocument = documentItems.find((doc) => doc.id === selectedDocumentId);
+-  const ocrReady = selectedDocument && ['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed'].includes(selectedDocument.processing_status);
++  const ocrReady = selectedDocument && ['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_processing', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed'].includes(selectedDocument.processing_status);
+   const ocr = useQuery({
+     queryKey: ['ocr', investigationId, selectedDocumentId, includeRaw],
+     queryFn: () => apiRequest<OCRResponse>(`/investigations/${investigationId}/documents/${selectedDocumentId}/ocr${includeRaw ? '?include_raw=true' : ''}`),
+@@ -466,14 +467,14 @@ export function InvestigationUnavailable() {
+   );
+   const documentStatus = useQuery({
+     queryKey: ['document-status', investigationId, selectedDocumentId],
+-    queryFn: () => apiRequest<{ id: string; status: string; error: string | null }>(`/investigations/${investigationId}/documents/${selectedDocumentId}/status`),
++    queryFn: () => apiRequest<{ id: string; status: string; error: string | null; error_code: string | null; retryable: boolean | null; attempts_remaining: number }>(`/investigations/${investigationId}/documents/${selectedDocumentId}/status`),
+     enabled: Boolean(selectedDocumentId && ['failed', 'relationship_extraction_failed'].includes(selectedDocument?.processing_status ?? '') && !relationshipsPage),
+   });
+   const graph = useQuery({
+     queryKey: ['relationships', investigationId],
+     queryFn: () => apiRequest<GraphResponse>(`/investigations/${investigationId}/relationships/graph`),
+     enabled: relationshipsPage,
+-    refetchInterval: () => documentItems.some((doc) => ['queued', 'processing', 'relationship_extraction_pending'].includes(doc.processing_status)) ? 2500 : false,
++    refetchInterval: () => documentItems.some((doc) => ['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(doc.processing_status)) ? 2500 : false,
+   });
+   async function uploadFiles(files: File[], form: HTMLFormElement) {
+     if (!files.length) return;
+@@ -531,6 +532,10 @@ export function InvestigationUnavailable() {
+ 
+   async function retryDocument(documentId: string) {
+     setError('');
++    if (documentItems.find((item) => item.id === documentId)?.processing_error_retryable === false) {
++      setError('This processing error is not retryable. Resolve its reported cause before retrying.');
++      return;
++    }
+     try {
+       await apiRequest(`/investigations/${investigationId}/documents/${documentId}/retry`, { method: 'POST' });
+       await Promise.all([
+@@ -636,11 +641,12 @@ export function InvestigationUnavailable() {
+         {overlayPage && <p className="muted">Region overlays use original-image coordinates from OCR · Page dimensions {overlayPage.width} × {overlayPage.height}.</p>}
+       </div>}
+       {selectedDocument.sha256 && <p className="muted">Original SHA-256: <code>{selectedDocument.sha256}</code> · uploaded {fmtDate(selectedDocument.created_at)} · {selectedDocument.source_description || 'source not described'}</p>}
++      {selectedDocument.analysis_stages && <p className="muted" aria-label="Document analysis stages">Source extraction: {selectedDocument.analysis_stages.source_extraction || 'pending'} · Deterministic evidence: {selectedDocument.analysis_stages.deterministic_evidence || 'pending'} · Investigation correlation: {selectedDocument.analysis_stages.investigation_correlation || 'pending'} · AI enrichment: {selectedDocument.analysis_stages.ai_enrichment || 'pending'} · Investigator review: {selectedDocument.analysis_stages.investigator_review || 'pending'}</p>}
+       {showRunHistory && <section className="panel" aria-label="OCR extraction history"><div className="panel-head"><div><h3>Versioned OCR extraction runs</h3><p>Each run retains its engine output and page/span references; older results are not overwritten.</p></div></div>{extractionRuns.isLoading ? <p role="status">Loading extraction runs…</p> : extractionRuns.isError ? <p role="alert">Extraction history could not be loaded.</p> : (extractionRuns.data?.items.length ?? 0) === 0 ? <p>No versioned extraction runs are available for this document yet.</p> : <><label className="auth-label">Compare with run<select aria-label="Select OCR run to inspect" value={selectedRunId || extractionRuns.data?.items[0]?.id || ''} onChange={(event) => setSelectedRunId(event.target.value)}>{extractionRuns.data?.items.map((run) => <option key={run.id} value={run.id}>Run {run.run_number} · {run.provider} {run.provider_version || ''} · {run.status}</option>)}</select></label><ul className="extraction-run-list">{extractionRuns.data?.items.map((run) => <li key={run.id}>Run {run.run_number} · {run.status} · {run.latency_ms == null ? 'duration unavailable' : `${run.latency_ms.toFixed(0)} ms`}{run.error_detail ? ` · ${run.error_detail}` : ''}</li>)}</ul>{extractionDetail.data && <div className="extraction-page-list"><h4>Run {extractionDetail.data.run_number} normalized pages and regions</h4>{extractionDetail.data.pages.map((page) => <article key={page.id}><b>Page {page.page_number}</b><small>{page.width && page.height ? `${page.width} × ${page.height}` : 'Page dimensions unavailable'}</small><pre>{page.text}</pre></article>)}</div>}</>}</section>}
+-      {['queued', 'processing', 'relationship_extraction_pending'].includes(selectedDocument.processing_status) && <p className="processing-help" role="status" aria-live="polite">{selectedDocument.processing_status === 'queued' ? 'Your upload is safe. The OCR worker will pick it up automatically as soon as it finishes the document ahead of it.' : selectedDocument.processing_status === 'processing' ? 'PaddleOCR is reading your image now. On the first run, OCR may take a few minutes while its models initialize.' : 'OCR is complete. Relationship analysis is now running automatically.'}</p>}
+-      {['failed', 'relationship_extraction_failed'].includes(selectedDocument.processing_status) && <p className="auth-error" role="alert">{documentStatus.data?.error ?? 'Processing failed. You can retry this document.'}</p>}
+-      {ocrReady && (ocr.isLoading ? <LoadingPanel/> : ocr.isError ? <QueryError onRetry={() => void ocr.refetch()}/> : <><div className="panel-head"><div><h3>Recognized text</h3><p>{ocr.data?.provider} {ocr.data?.provider_version ? `v${ocr.data.provider_version}` : ''} · {ocr.data?.blocks.length ?? 0} source blocks</p></div><button className="button secondary small" onClick={() => setIncludeRaw((value) => !value)}>{includeRaw ? 'Hide raw engine output' : 'Show raw engine output'}</button></div><pre className="ocr-text">{ocr.data?.recognized_text || 'No text was recognized.'}</pre><label className="auth-label">Search OCR regions<input value={regionSearch} onChange={(event) => setRegionSearch(event.target.value)} placeholder="Search text or block ID"/></label><div className="ocr-block-list">{displayedBlocks.map((block) => <button id={`ocr-block-${block.block_id}`} type="button" className={`ocr-region-card ${selectedBlockId === block.block_id ? 'is-selected' : ''}`} key={block.block_id} onClick={() => setSelectedBlockId(block.block_id)}><b>{block.block_id}</b><small>{block.page_index == null ? block.source_path : `Page ${block.page_index + 1} · ${block.source_path}`}</small><p>{block.text}</p>{block.engine_bbox != null && <small>Bounds: {JSON.stringify(block.engine_bbox)}{block.engine_confidence == null ? '' : ` · engine confidence ${block.engine_confidence} (not calibrated accuracy)`}</small>}</button>)}</div>{includeRaw && <pre className="ocr-text">{JSON.stringify(ocr.data?.raw_result, null, 2)}</pre>}</>)}
++      {['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(selectedDocument.processing_status) && <p className="processing-help" role="status" aria-live="polite">{selectedDocument.processing_status === 'queued' ? 'Your upload is safe. The OCR worker will pick it up automatically as soon as it finishes the document ahead of it.' : selectedDocument.processing_status === 'processing' ? 'PaddleOCR is reading your image now. On the first run, OCR may take a few minutes while its models initialize.' : 'OCR is complete. Relationship analysis is now running automatically.'}</p>}
++      {['failed', 'relationship_extraction_failed'].includes(selectedDocument.processing_status) && <p className={selectedDocument.analysis_stages?.deterministic_evidence === 'completed' ? 'processing-help' : 'auth-error'} role={selectedDocument.analysis_stages?.deterministic_evidence === 'completed' ? 'status' : 'alert'}>{selectedDocument.analysis_stages?.deterministic_evidence === 'completed' ? `AI enrichment ${selectedDocument.analysis_stages.ai_enrichment || 'failed'}; deterministic evidence and investigation correlation remain available.` : documentStatus.data?.error ?? selectedDocument.processing_error ?? 'Processing failed.'}{(documentStatus.data?.error_code ?? selectedDocument.processing_error_code) ? ` (${documentStatus.data?.error_code ?? selectedDocument.processing_error_code})` : ''}</p>}
++      {ocrReady && (ocr.isLoading ? <LoadingPanel/> : ocr.isError ? <QueryError onRetry={() => void ocr.refetch()}/> : <><div className="panel-head"><div><h3>Extracted source text</h3><p>{ocr.data?.provider} {ocr.data?.provider_version ? `v${ocr.data.provider_version}` : ''} · {ocr.data?.blocks.length ?? 0} source blocks · {ocr.data?.extraction_coverage?.page_count ?? '—'} page(s)</p></div><button className="button secondary small" onClick={() => setIncludeRaw((value) => !value)}>{includeRaw ? 'Hide raw extraction output' : 'Show raw extraction output'}</button></div><pre className="ocr-text">{ocr.data?.recognized_text || 'No text was extracted.'}</pre><label className="auth-label">Search source regions<input value={regionSearch} onChange={(event) => setRegionSearch(event.target.value)} placeholder="Search text or block ID"/></label><div className="ocr-block-list">{displayedBlocks.map((block) => <button id={`ocr-block-${block.block_id}`} type="button" className={`ocr-region-card ${selectedBlockId === block.block_id ? 'is-selected' : ''}`} key={block.block_id} onClick={() => setSelectedBlockId(block.block_id)}><b>{block.block_id}</b><small>{block.page_index == null ? block.source_path : `Page ${block.page_index + 1} · ${block.source_path}`}</small><small>Method: {block.extraction_method || 'ocr'}{block.table_structure_status ? ` · table structure ${block.table_structure_status}` : ''}{block.bbox_space ? ` · ${block.bbox_space}` : ''}</small><p>{block.text}</p>{block.cells?.length ? <small>Cells: {block.cells.map((cell) => `${cell.header || `Column ${cell.column_index + 1}`} = ${cell.raw_text}`).join(' · ')}</small> : null}{block.engine_bbox != null && <small>Bounds: {JSON.stringify(block.engine_bbox)}{block.engine_confidence == null ? '' : ` · engine confidence ${block.engine_confidence} (not calibrated accuracy)`}</small>}</button>)}</div>{ocr.data?.extraction_coverage && <p className="muted">Coverage: {ocr.data.extraction_coverage.pages_with_ocr_text ?? 0} page(s) with OCR text, {ocr.data.extraction_coverage.pages_with_native_text ?? 0} with native PDF text, and {ocr.data.extraction_coverage.native_pdf_blocks ?? 0} native table/text blocks.</p>}{includeRaw && <pre className="ocr-text">{JSON.stringify(ocr.data?.raw_result, null, 2)}</pre>}</>)}
+     </section>}
+-    <div className="dashboard-boundary"><ShieldCheck size={14}/><span>OCR output preserves the engine JSON and source block references. Relationship claims are descriptive and cite their source blocks.</span></div>
++    <div className="dashboard-boundary"><ShieldCheck size={14}/><span>Native PDF text and OCR remain separate source observations. Table cells retain row and column references when the PDF layout supports them; other layouts are marked uncertain.</span></div>
+   </section>;
+ }

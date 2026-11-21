@@ -130,7 +130,7 @@ describe('DocForensIQ authentication and workspace', () => {
     });
     renderAt('/investigations/case-123');
     fireEvent.click(await screen.findByRole('button', { name: 'invoice.png' }));
-    expect(await screen.findByRole('heading', { name: 'Recognized text' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Extracted source text' })).toBeInTheDocument();
     expect(screen.getAllByText('ACME Ltd')).toHaveLength(2);
     expect(screen.getByText('block_000001')).toBeInTheDocument();
   });

@@ -7,8 +7,9 @@ from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 from app.db.base import Base
+from app.db.sqlite import enable_sqlite_foreign_keys
 from app.models.entities import (  # noqa: F401
-    ActivityEvent, AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, Finding,
+    ActivityEvent, AuditChainEvent, DerivedGraphNode, Document, DossierSnapshot, Finding, PdfForensicArtifact, PdfForensicRun,
     Investigation, OCRResult, OcrEvaluationRun, PasswordResetToken, RefreshSession,
     RelationshipAnalysis, TimelineEvent, User, VisualAnalysisArtifact, VisualAnalysisPage, VisualAnalysisRun, VisualCandidateRegion,
 )
@@ -38,6 +39,7 @@ async def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=NullPool,
     )
+    enable_sqlite_foreign_keys(connectable)
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()

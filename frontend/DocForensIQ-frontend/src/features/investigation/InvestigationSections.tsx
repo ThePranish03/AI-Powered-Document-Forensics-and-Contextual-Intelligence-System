@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { useQueries, useQuery } from '@tanstack/react-query';
-import { Activity, CalendarClock, CheckCircle2, FileCheck2, FileText, Layers3, Link2, ShieldAlert } from 'lucide-react';
+import { Activity, CalendarClock, CheckCircle2, FileCheck2, FileSearch, FileText, Layers3, Link2, ShieldAlert } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { apiRequest } from '../../services/apiClient';
 import type { RelationshipDocument } from '../relationships/RelationshipExplorer';
@@ -12,12 +12,13 @@ interface InvestigationRecord {
 interface DocumentRecord extends RelationshipDocument { source_description?: string | null; }
 interface OCRPayload {
   document_id: string; provider: string; provider_version: string | null; recognized_text: string;
-  blocks: Array<{ block_id: string; source_path: string; text: string; page_index?: number; engine_bbox?: unknown; engine_confidence?: number }>;
+  extraction_coverage?: { page_count?: number; ocr_blocks?: number; native_pdf_blocks?: number; pages_with_native_text?: number; pages_with_ocr_text?: number; status?: string; reason?: string };
+  blocks: Array<{ block_id: string; source_path: string; text: string; page_index?: number; engine_bbox?: unknown; engine_confidence?: number | null; extraction_method?: string; bbox_space?: string; table_structure_status?: string; cells?: Array<{ header?: string | null; raw_text: string; column_index: number; bbox?: unknown }> }>;
 }
 interface TimelineRecord { id: string; raw_date: string; interpreted_date: string | null; ambiguous: boolean; description: string; confidence: number; evidence_refs: Array<{ document_id?: string; filename?: string; page_number?: number | null; block_id?: string | null }>; annotation: string | null; }
 interface FindingRecord { id: string; title: string; severity: string; status: string; finding_type: string; }
 
-const processedStatuses = new Set(['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed']);
+const processedStatuses = new Set(['ocr_completed', 'relationship_extraction_pending', 'relationship_extraction_processing', 'relationship_extraction_completed', 'relationship_extraction_failed', 'completed']);
 const dateLabel = (value: string) => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 const formatBytes = (value: number) => value < 1024 * 1024 ? `${(value / 1024).toFixed(0)} KB` : `${(value / 1024 / 1024).toFixed(2)} MB`;
 const typeLabel = (document: DocumentRecord) => document.content_type || 'Unknown file type';
@@ -28,6 +29,7 @@ export function InvestigationOverview({ investigationId }: { investigationId: st
   const findings = useQuery({ queryKey: ['findings', investigationId, ''], queryFn: () => apiRequest<{ items: FindingRecord[] }>(`/investigations/${investigationId}/findings`) });
   const timeline = useQuery({ queryKey: ['timeline', investigationId], queryFn: () => apiRequest<{ items: TimelineRecord[] }>(`/investigations/${investigationId}/timeline`) });
   const correlations = useQuery({ queryKey: ['correlation', investigationId], queryFn: () => apiRequest<{ summary: { total_links: number; confirmed_links: number; candidate_links: number; contradictions: number } }>(`/investigations/${investigationId}/correlation`) });
+  const pdfStructure = useQuery({ queryKey: ['pdf-forensics-summary', investigationId], queryFn: () => apiRequest<{ summary: { pdf_documents: number; documents_analyzed: number; pages_analyzed: number; completed: number; partial: number } }>(`/investigations/${investigationId}/pdf-forensics/summary`) });
   const docs = documents.data ?? [];
   const items = findings.data?.items ?? [];
   const events = useMemo(() => [...(timeline.data?.items ?? [])].sort((a, b) => {
@@ -38,7 +40,7 @@ export function InvestigationOverview({ investigationId }: { investigationId: st
     if (Number.isFinite(right)) return 1;
     return a.raw_date.localeCompare(b.raw_date);
   }), [timeline.data]);
-  const pendingDocs = docs.filter((doc) => ['queued', 'processing', 'relationship_extraction_pending'].includes(doc.processing_status)).length;
+  const pendingDocs = docs.filter((doc) => ['queued', 'processing', 'relationship_extraction_pending', 'relationship_extraction_processing'].includes(doc.processing_status)).length;
   const completedDocs = docs.filter((doc) => processedStatuses.has(doc.processing_status)).length;
   const workflowSteps: Array<[string, string, string, boolean]> = [
     ['01', 'Documents collected', `${docs.length} source document(s)`, docs.length > 0],
@@ -57,6 +59,7 @@ export function InvestigationOverview({ investigationId }: { investigationId: st
       <article className="stat-card"><FileCheck2 size={17}/><span className="stat-label">CANDIDATE FINDINGS</span><strong>{findings.isLoading ? '—' : items.length}</strong><small>{items.filter((item) => item.status === 'accepted').length} accepted by investigator · automated results remain candidates</small></article>
       <article className="stat-card"><Link2 size={17}/><span className="stat-label">CROSS-DOCUMENT LINKS</span><strong>{correlations.data?.summary.total_links ?? (correlations.isLoading ? '—' : 0)}</strong><small>{correlations.data?.summary.confirmed_links ?? 0} confirmed · {correlations.data?.summary.candidate_links ?? 0} candidates</small></article>
       <article className="stat-card"><CalendarClock size={17}/><span className="stat-label">TIMELINE EVENTS</span><strong>{timeline.data?.items.length ?? (timeline.isLoading ? '—' : 0)}</strong><small>Events retain the date interpretation and source reference</small></article>
+      <article className="stat-card"><FileSearch size={17}/><span className="stat-label">PDF STRUCTURE COVERAGE</span><strong>{pdfStructure.data?.summary.documents_analyzed ?? (pdfStructure.isLoading ? '—' : 0)} / {pdfStructure.data?.summary.pdf_documents ?? docs.filter((doc) => doc.content_type === 'application/pdf').length}</strong><small>{pdfStructure.data?.summary.pages_analyzed ?? 0} pages analyzed · {pdfStructure.data?.summary.partial ?? 0} partial</small></article>
     </div>
     <div className="dashboard-columns investigation-overview-columns">
       <section className="panel"><div className="panel-head"><div><h3>Investigation workflow</h3><p>Current coverage from persisted records</p></div><Activity size={16}/></div><ol className="investigation-workflow-list">
@@ -65,7 +68,7 @@ export function InvestigationOverview({ investigationId }: { investigationId: st
       <section className="panel"><div className="panel-head"><div><h3>Evidence inventory</h3><p>Stored sources · latest activity {investigation.data?.updated_at ? dateLabel(investigation.data.updated_at) : 'unavailable'}</p></div><Link className="text-link" to={`/investigations/${investigationId}/classification`}>Review classification</Link></div>{docs.length ? <ul className="overview-document-list">{docs.slice(0, 6).map((doc) => <li key={doc.id}><span className="overview-file-icon"><FileText size={15}/></span><span className="overview-document-copy"><b>{doc.filename}</b><small>{typeLabel(doc)} · {formatBytes(doc.size_bytes)}</small></span><span className="badge blue">{doc.processing_status.replaceAll('_', ' ')}</span><Link className="text-link" aria-label={`Open ${doc.filename}`} to={`/investigations/${investigationId}?doc=${doc.id}`}>Open</Link></li>)}</ul> : <div className="dashboard-empty"><p>No source documents have been added.</p><Link className="button secondary small" to={`/investigations/${investigationId}`}>Add evidence</Link></div>}</section>
     </div>
     <section className="panel"><div className="panel-head"><div><h3>Latest timeline events</h3><p>Chronologically ordered where the OCR date can be interpreted.</p></div><Link className="text-link" to={`/investigations/${investigationId}/timeline`}>Open timeline</Link></div>{timeline.isLoading ? <p role="status">Loading stored events…</p> : events.length ? <div className="overview-timeline">{events.slice(0, 4).map((event) => <article key={event.id}><span className="overview-timeline-dot"/><div><b>{event.interpreted_date || event.raw_date}{event.ambiguous ? ' · ambiguous' : ''}</b><p>{event.description}</p><small>{event.evidence_refs[0]?.filename || 'Source not named'}{event.evidence_refs[0]?.page_number ? ` · page ${event.evidence_refs[0].page_number}` : ''}</small></div></article>)}</div> : <p className="panel-foot">No timeline events have been generated yet.</p>}</section>
-    <p className="investigation-data-note"><ShieldAlert size={14}/> This summary reflects persisted analysis records. Missing data is shown as unavailable or zero; it is not inferred.</p>
+    <p className="investigation-data-note"><ShieldAlert size={14}/> This summary reflects persisted analysis records. Missing data is shown as unavailable or zero; it is not inferred.{pdfStructure.isError ? ' PDF structure coverage could not be loaded.' : ''}</p>
   </div>;
 }
 
@@ -88,7 +91,7 @@ export function InvestigationExtractedData({ investigationId, documents }: { inv
   const readyDocs = documents.filter((doc) => processedStatuses.has(doc.processing_status));
   const isLoading = results.some((result) => result.isLoading);
   return <div className="investigation-section-page">
-    <section className="panel section-intro"><p className="eyebrow"><FileText size={14}/> OCR-EXTRACTED DATA</p><h2>Recognized information by source</h2><p>Text below is taken from persisted OCR blocks, grouped by source document and page. Explicit label/value lines are formatted for scanning while preserving the original text and block citation.</p><div className="classification-summary"><div><b>{readyDocs.length}</b><small>OCR-ready documents</small></div><div><b>{results.reduce((sum, result) => sum + (result.data?.blocks.length ?? 0), 0)}</b><small>stored OCR blocks loaded</small></div><div><b>{results.reduce((sum, result) => sum + (result.data?.blocks.reduce((count, block) => count + (block.engine_confidence != null ? 1 : 0), 0) ?? 0), 0)}</b><small>blocks with engine score</small></div></div></section>
+    <section className="panel section-intro"><p className="eyebrow"><FileText size={14}/> EXTRACTED SOURCE EVIDENCE</p><h2>Recognized information by source</h2><p>Native PDF text and OCR observations retain separate methods and source references. Detected table rows preserve their cells; uncertain layouts remain marked for review.</p><div className="classification-summary"><div><b>{readyDocs.length}</b><small>evidence-ready documents</small></div><div><b>{results.reduce((sum, result) => sum + (result.data?.blocks.length ?? 0), 0)}</b><small>stored source blocks loaded</small></div><div><b>{results.reduce((sum, result) => sum + (result.data?.blocks.filter((block) => block.extraction_method === 'native_pdf_table').length ?? 0), 0)}</b><small>native table rows</small></div></div></section>
     {isLoading && <div className="panel" role="status">Loading OCR data for stored sources…</div>}
     {!readyDocs.length && <div className="panel dashboard-empty"><FileText size={20}/><h3>No OCR results available</h3><p>Documents will appear here after OCR processing completes.</p><Link className="text-link" to={`/investigations/${investigationId}/classification`}>Review processing status</Link></div>}
     {readyDocs.map((doc, index) => {
@@ -96,10 +99,10 @@ export function InvestigationExtractedData({ investigationId, documents }: { inv
       const blocks = query?.data?.blocks ?? [];
       const pages = new Map<number, typeof blocks>();
       for (const block of blocks) { const page = (block.page_index ?? 0) + 1; pages.set(page, [...(pages.get(page) ?? []), block]); }
-      return <section className="panel extracted-document" key={doc.id}><div className="panel-head"><div><p className="eyebrow">SOURCE DOCUMENT</p><h3>{doc.filename}</h3><p>{query?.data?.provider || 'OCR provider unavailable'}{query?.data?.provider_version ? ` · ${query.data.provider_version}` : ''} · {blocks.length} block(s)</p></div><Link className="button secondary small" to={`/investigations/${investigationId}?doc=${doc.id}`}>Open source</Link></div>
+      return <section className="panel extracted-document" key={doc.id}><div className="panel-head"><div><p className="eyebrow">SOURCE DOCUMENT</p><h3>{doc.filename}</h3><p>{query?.data?.provider || 'Extraction provider unavailable'}{query?.data?.provider_version ? ` · ${query.data.provider_version}` : ''} · {blocks.length} source block(s){query?.data?.extraction_coverage ? ` · ${query.data.extraction_coverage.pages_with_native_text ?? 0} page(s) with native text` : ''}</p></div><Link className="button secondary small" to={`/investigations/${investigationId}?doc=${doc.id}`}>Open source</Link></div>
         {query?.isError ? <div className="panel-foot" role="alert">OCR data could not be loaded for this source. <Link className="text-link" to={`/investigations/${investigationId}?doc=${doc.id}`}>Open document</Link></div> : blocks.length ? [...pages.entries()].sort(([a], [b]) => a - b).map(([page, pageBlocks]) => <div className="extracted-page" key={page}><div className="extracted-page-heading"><span>PAGE {page}</span><span>{pageBlocks.length} extracted region(s)</span></div><div className="extracted-field-grid">{pageBlocks.map((block) => {
           const match = block.text.match(/^\s*([^:|–—]{2,60})\s*[:|–—]\s*(.+?)\s*$/);
-          return <article className="extracted-field-card" key={block.block_id}><div className="extracted-field-heading"><b>{match?.[1]?.trim() || 'Recognized text'}</b><Link className="extracted-block-link" to={`/investigations/${investigationId}?doc=${doc.id}&page=${page}&block=${encodeURIComponent(block.block_id)}`}>{block.block_id}</Link></div><p>{match?.[2]?.trim() || block.text || 'Empty OCR block'}</p><small>{block.engine_confidence == null ? 'OCR score unavailable' : `Engine score ${(block.engine_confidence * 100).toFixed(0)}% · not calibrated accuracy`}{block.source_path ? ` · ${block.source_path}` : ''}</small><details><summary>Original OCR block</summary><blockquote>{block.text}</blockquote></details></article>;
+          return <article className="extracted-field-card" key={block.block_id}><div className="extracted-field-heading"><b>{match?.[1]?.trim() || (block.table_structure_status ? `Table row ${block.cells?.length ?? ''}` : 'Recognized text')}</b><Link className="extracted-block-link" to={`/investigations/${investigationId}?doc=${doc.id}&page=${page}&block=${encodeURIComponent(block.block_id)}`}>{block.block_id}</Link></div><p>{match?.[2]?.trim() || block.text || 'Empty source block'}</p><small>{block.extraction_method || 'ocr'}{block.table_structure_status === 'uncertain' ? ' · table structure uncertain' : ''}{block.bbox_space ? ` · ${block.bbox_space}` : ''}{block.engine_confidence == null ? ' · confidence unavailable' : ` · engine score ${(block.engine_confidence * 100).toFixed(0)}% (not calibrated accuracy)`}{block.source_path ? ` · ${block.source_path}` : ''}</small>{block.cells?.length ? <details><summary>Table cells ({block.cells.length})</summary><dl>{block.cells.map((cell) => <div key={`${cell.column_index}-${cell.header}`}><dt>{cell.header || `Column ${cell.column_index + 1}`}</dt><dd>{cell.raw_text}</dd></div>)}</dl></details> : <details><summary>Original source block</summary><blockquote>{block.text}</blockquote></details>}</article>;
         })}</div></div>) : <p className="panel-foot">No non-empty OCR blocks are stored for this source.</p>}
       </section>;
     })}

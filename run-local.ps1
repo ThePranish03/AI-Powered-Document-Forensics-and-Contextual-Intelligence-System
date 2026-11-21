@@ -3,7 +3,8 @@ $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
 $backendDir = Join-Path $projectRoot "backend"
 $frontendDir = Join-Path $projectRoot "frontend\DocForensIQ-frontend"
-$ocrDir = Join-Path $projectRoot "..\extra_things\PaddleOcr\ocr_evaluation"
+$configuredOcrDir = $env:PADDLEOCR_PROJECT_PATH
+$ocrDir = if ($configuredOcrDir) { $configuredOcrDir } else { Join-Path $projectRoot "..\extra_things\PaddleOcr\ocr_evaluation" }
 $backendEnv = Join-Path $backendDir ".env"
 $frontendEnv = Join-Path $frontendDir ".env.local"
 $logDir = Join-Path $projectRoot "logs"
@@ -18,7 +19,7 @@ if ($occupiedPorts) { throw "Ports 8000/5173 are already in use. Do not start a 
 
 if (-not (Test-Path -LiteralPath $backendEnv)) {
     Copy-Item -LiteralPath (Join-Path $backendDir ".env.example") -Destination $backendEnv
-    Write-Host "Created backend\.env from its example. Add your xAI key there to enable relationship extraction."
+    Write-Host "Created backend\.env from its example. Add your Groq API key there to enable LLM features."
 }
 if (-not (Test-Path -LiteralPath $frontendEnv)) {
     Copy-Item -LiteralPath (Join-Path $frontendDir ".env.example") -Destination $frontendEnv
@@ -60,6 +61,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules"))) {
 Write-Host "Checking the isolated PaddleOCR runner..."
 Push-Location $ocrDir
 try {
+    & $ocrPython -c "import fitz, paddle, paddleocr, paddlex; print('PaddleOCR runtime dependencies are ready; PyMuPDF ' + fitz.VersionBind)"
+    if ($LASTEXITCODE -ne 0) { throw "PaddleOCR dependencies are incomplete. Reinstall the isolated environment with: python -m pip install -e `".[test,paddle]`" from $ocrDir" }
     & $ocrPython -m ocr_evaluation.main --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "PaddleOCR environment is missing the evaluation runner or its dependencies." }
 } finally {
@@ -70,6 +73,10 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $pythonPath = Join-Path $backendDir ".venv\Scripts\python.exe"
 $vitePath = Join-Path $frontendDir "node_modules\vite\bin\vite.js"
 $processes = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+$previousOcrPython = $env:PADDLEOCR_PYTHON
+$previousOcrProject = $env:PADDLEOCR_PROJECT_PATH
+$env:PADDLEOCR_PYTHON = $ocrPython
+$env:PADDLEOCR_PROJECT_PATH = $ocrDir
 
 try {
     $processes.Add((Start-Process -FilePath $pythonPath -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000") -WorkingDirectory $backendDir -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logDir "api.out.log") -RedirectStandardError (Join-Path $logDir "api.err.log")))
@@ -100,4 +107,6 @@ try {
             & taskkill.exe /PID $process.Id /T /F | Out-Null
         }
     }
+    $env:PADDLEOCR_PYTHON = $previousOcrPython
+    $env:PADDLEOCR_PROJECT_PATH = $previousOcrProject
 }

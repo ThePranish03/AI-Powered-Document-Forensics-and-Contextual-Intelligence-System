@@ -49,18 +49,38 @@ def _visual_check_records(runs: list[dict]) -> list[dict]:
     return records
 
 
-def build_snapshot(*, investigation: dict, documents: list[dict], findings: list[dict], timeline: list[dict], nodes: list[dict], correlations: list[dict], discrepancies: list[dict], audit_activity: list[dict] | None = None, document_relationships: list[dict] | None = None, audit_verification: dict | None = None, visual_runs: list[dict] | None = None) -> dict:
+def build_snapshot(*, investigation: dict, documents: list[dict], findings: list[dict], timeline: list[dict], nodes: list[dict], correlations: list[dict], discrepancies: list[dict], audit_activity: list[dict] | None = None, document_relationships: list[dict] | None = None, audit_verification: dict | None = None, visual_runs: list[dict] | None = None, pdf_runs: list[dict] | None = None) -> dict:
     visual_runs = visual_runs or []
+    pdf_runs = pdf_runs or []
     visual_statuses = [run.get("status") for run in visual_runs]
     visual_status = "not_run" if not visual_runs else "failed" if all(status == "failed" for status in visual_statuses) else "unavailable" if all(status == "unavailable" for status in visual_statuses) else "completed" if all(status == "completed" for status in visual_statuses) else "running" if all(status in {"queued", "processing"} for status in visual_statuses) else "partial"
+    pdf_statuses = [run.get("status") for run in pdf_runs]
+    pdf_status = "not_run" if not pdf_runs else "completed" if all(status == "completed" for status in pdf_statuses) else "unavailable" if all(status == "unavailable" for status in pdf_statuses) else "failed" if all(status == "failed" for status in pdf_statuses) else "partial"
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "label": "Evidence snapshot. Automated items remain candidates until an investigator reviews them.",
         "investigation": investigation,
         "evidence_inventory": documents,
+        "document_processing_diagnostics": [{
+            "document_id": item.get("id"), "filename": item.get("filename"),
+            "processing_status": item.get("processing_status"),
+            "relationship_extraction_status": item.get("relationship_extraction_status", "not_run"),
+            "error_code": item.get("processing_error_code"),
+            "error": item.get("processing_error"),
+            "retryable": item.get("processing_error_retryable"),
+            "ocr_attempts": item.get("processing_attempts", 0),
+            "relationship_attempts": item.get("relationship_extraction_attempts", 0),
+            "extraction_runs": item.get("extraction_runs", []),
+        } for item in documents],
         "extracted_information": [{
             "document_id": item["id"], "filename": item["filename"],
             "text": item.get("extracted_text", ""), "blocks": item.get("extracted_blocks", []),
+            "coverage": item.get("extraction_coverage"),
+            "structured_fields": item.get("structured_fields", []),
+            "table_rows": item.get("table_rows", []),
+            "extraction_runs": item.get("extraction_runs", []),
+            "relationship_extraction_status": item.get("relationship_extraction_status", "not_run"),
+            "processing_error_code": item.get("processing_error_code"),
         } for item in documents if item.get("extracted_text") or item.get("extracted_blocks")],
         "relationship_overview": nodes,
         "document_relationships": document_relationships or [],
@@ -73,14 +93,26 @@ def build_snapshot(*, investigation: dict, documents: list[dict], findings: list
             "methodology": "Visual checks are reported as distinct methods. TruFor integrity output uses the recorded model semantics and is not a fraud probability; map artifacts and candidate regions are source-linked when present.",
             "limitations": ["No model output is inferred when the engine did not produce it.", "Localization and reliability artifacts are analytical outputs and do not establish manipulation.", "Region coordinates are retained in their recorded pixel and PDF point spaces; OCR links are included only when stored.", "A report captures investigator disposition at snapshot generation time."],
         },
+        "pdf_structural_analysis": {
+            "status": pdf_status,
+            "runs": pdf_runs,
+            "limitations": [
+                "PDF structure is reported using the recorded parser and version; the report is not a complete ISO 32000 validator.",
+                "Revision object changes are available for classic xref tables; xref streams and hybrid-reference PDFs remain unsupported.",
+                "pyHanko verifies signature integrity; certificate trust is not established without configured trust roots and revocation data.",
+                "Metadata and object facts are descriptive and do not independently establish alteration or intent.",
+            ],
+        },
+        "cross_method_correlations": {"schema_version": "pdf_ocr_visual_correlation_v1", "method": "same_document_page_and_pdf_point_bbox_overlap_v1", "links": [], "limitations": []},
         "timeline": timeline,
         "findings": findings,
         "reviewed_findings": [item for item in findings if item["status"] != "candidate"],
         "audit_activity": audit_activity or [],
         "audit_chain_verification": audit_verification or {"valid": False, "event_count": len(audit_activity or []), "verified_count": 0, "reason": "Not verified."},
         "methodology": [
-            "Findings are produced by deterministic rules over stored OCR text and exact labeled identifiers.",
+            "Findings are produced by deterministic rules over stored OCR and native PDF text, structured table rows, and exact labeled identifiers.",
             "OCR text and engine confidence are extracted signals; review the unmodified source before drawing conclusions.",
+            "Per-document extraction coverage distinguishes OCR blocks from native PDF text/table blocks and does not measure extraction accuracy.",
             "Cross-document links are candidates based on exact identifiers and do not establish common identity or transaction.",
             "The report is a versioned snapshot of database records at generation time.",
         ],
@@ -89,6 +121,7 @@ def build_snapshot(*, investigation: dict, documents: list[dict], findings: list
             "Engine confidence is not calibrated accuracy.",
             "Rules can miss context such as credits, rounding, or multi-currency totals.",
             "Visual-forensics observations are algorithmic candidates; they do not determine document authenticity.",
+            "PDF revision inventories are limited to classic xref tables; xref streams and hybrid-reference files are unsupported. pyHanko verifies signature integrity, while signer trust requires an explicitly configured trust context.",
             "Investigator conclusions are only included when explicitly recorded in stored data.",
             "Language-model narrative is an optional, source-cited summary and does not create evidence or conclusions.",
         ],
@@ -121,15 +154,29 @@ def render_html(snapshot: dict) -> str:
 
     extracted = []
     for item in snapshot.get("extracted_information", []):
+        coverage = item.get("coverage") or {}
+        coverage_summary = " · ".join(
+            f"{label}: {coverage.get(key)}" for key, label in (
+                ("page_count", "Pages"), ("ocr_blocks", "OCR blocks"),
+                ("native_pdf_blocks", "Native PDF blocks"),
+                ("pages_with_ocr_text", "Pages with OCR"),
+                ("pages_with_native_text", "Pages with native text"),
+            ) if coverage.get(key) is not None
+        )
         blocks = "".join(
-            "<tr><td>{page}</td><td><code>{block}</code></td><td>{confidence}</td><td>{bbox}</td><td>{text}</td></tr>".format(
+            "<tr><td>{page}</td><td><code>{block}</code></td><td>{method}</td><td>{confidence}</td><td>{bbox}</td><td>{text}</td></tr>".format(
                 page=_esc((block.get("page_index", 0) + 1) if isinstance(block.get("page_index", 0), int) else "unknown"),
-                block=_esc(block.get("block_id")), confidence=_esc(block.get("engine_confidence", "not recorded")),
+                block=_esc(block.get("block_id")), method=_esc(block.get("extraction_method", "ocr")), confidence=_esc(block.get("engine_confidence", "not recorded")),
                 bbox=_esc(block.get("engine_bbox", block.get("bounding_box", "not recorded"))), text=_esc(block.get("text")),
             ) for block in item.get("blocks", [])
         )
-        extracted.append("<article><h3>{}</h3><p>Document ID: <code>{}</code></p><pre>{}</pre><table><thead><tr><th>Page</th><th>Block</th><th>Engine confidence</th><th>Coordinates</th><th>OCR text</th></tr></thead><tbody>{}</tbody></table></article>".format(
-            _esc(item.get("filename")), _esc(item.get("document_id")), _esc(item.get("text")), blocks or "<tr><td colspan='5'>No OCR blocks were stored.</td></tr>"))
+        extracted.append("<article><h3>{}</h3><p>Document ID: <code>{}</code></p><p>Extraction coverage: {}</p><pre>{}</pre><table><thead><tr><th>Page</th><th>Block</th><th>Extraction method</th><th>Engine confidence</th><th>Coordinates</th><th>Source text</th></tr></thead><tbody>{}</tbody></table></article>".format(
+            _esc(item.get("filename")), _esc(item.get("document_id")), _esc(coverage_summary or "not recorded"), _esc(item.get("text")), blocks or "<tr><td colspan='6'>No evidence blocks were stored.</td></tr>"))
+        extracted.append("<article><h4>Structured fields and source rows</h4><p>Relationship extraction stage: {}</p><pre>{}</pre><p>OCR run history: {}</p></article>".format(
+            _esc(item.get("relationship_extraction_status", "not_run")),
+            _esc(json.dumps({"structured_fields": item.get("structured_fields", []), "table_rows": item.get("table_rows", [])}, ensure_ascii=False, indent=2)),
+            _esc(json.dumps(item.get("extraction_runs", []), ensure_ascii=False)),
+        ))
 
     findings = []
     for item in snapshot.get("findings", []):
@@ -153,6 +200,19 @@ def render_html(snapshot: dict) -> str:
     visual_runs = "".join("<article><h3>Run {}</h3><p>Document <code>{}</code> · source SHA-256 <code>{}</code> · status {} · analyzer/model {}/{}</p>{}</article>".format(
         _esc(run.get("id")), _esc(run.get("document_id")), _esc(run.get("source_sha256") or "not available"), _esc(run.get("status")), _esc(run.get("analyzer_version") or "not recorded"), _esc(run.get("model_version") or "not reported"),
         "".join("<h4>Page {}</h4><p>Status {} · Integrity output {} ({})</p><p>Localization artifact {} · Reliability artifact {}</p>{}".format(_esc(page.get("page_number")), _esc(page.get("status")), _esc(page.get("integrity_score") if page.get("integrity_score") is not None else "unavailable"), _esc(page.get("integrity_meaning") or "meaning not recorded"), _esc(page.get("localization_artifact_id") or "unavailable"), _esc(page.get("reliability_artifact_id") or "unavailable"), "<ul>" + "".join("<li>Region {} · pixel {} · PDF points {} · disposition {} · OCR blocks {}</li>".format(_esc(region.get("region_index")), _esc(region.get("bbox_pixel")), _esc(region.get("bbox_pdf_points")), _esc(region.get("review_status", "needs_review")), _esc(", ".join(region.get("linked_ocr_block_ids", [])) or "none recorded")) for region in page.get("regions", [])) + "</ul>") for page in run.get("pages", [])) or "<p>No page-level outputs were stored.</p>") for run in snapshot.get("visual_analysis", {}).get("runs", []))
+    pdf_runs = "".join("<article><h3>PDF analysis · {}</h3><p>Run <code>{}</code> · document <code>{}</code> · source SHA-256 <code>{}</code> · parser {}/{} · status {}</p><p>{} page(s) · {} parser-reported revision(s) · {} cross-reference entries · {} embedded image(s) · {} detected signature object(s) · signature verification: {} · {} JavaScript name reference(s)</p><p>Metadata: <pre>{}</pre></p><p>Object types: <code>{}</code></p><ul>{}</ul></article>".format(
+        _esc(run.get("created_at")), _esc(run.get("id")), _esc(run.get("document_id")), _esc(run.get("source_sha256")),
+        _esc((run.get("parser") or {}).get("name")), _esc((run.get("parser") or {}).get("version")), _esc(run.get("status")),
+        _esc((run.get("result") or {}).get("document", {}).get("page_count", 0)), _esc((run.get("result") or {}).get("document", {}).get("revision_count", "unavailable")),
+        _esc((run.get("result") or {}).get("document", {}).get("xref_entry_count", "unavailable")), _esc(len((run.get("result") or {}).get("document", {}).get("embedded_images", []))),
+        _esc(len((run.get("result") or {}).get("document", {}).get("signature_objects", []))), _esc((run.get("result") or {}).get("signature_verification", {}).get("status", "unavailable")), _esc((run.get("result") or {}).get("document", {}).get("javascript_reference_count", "unavailable")),
+        _esc(json.dumps((run.get("result") or {}).get("document", {}).get("metadata", {}), ensure_ascii=False, indent=2)),
+        _esc(json.dumps((run.get("result") or {}).get("objects", {}).get("type_counts", {}), ensure_ascii=False)),
+        "".join("<li>{}</li>".format(_esc(item)) for item in (run.get("result") or {}).get("limitations", []))) for run in snapshot.get("pdf_structural_analysis", {}).get("runs", []))
+    cross_method_html = "".join("<article><h3>Correlated candidate · page {}</h3><p>Methods: {} · overlap: {}</p><p>{}</p><pre>{}</pre></article>".format(
+        _esc(item.get("page_number")), _esc(", ".join(item.get("methods", []))), _esc(item.get("overlap_ratio")),
+        _esc(item.get("interpretation")), _esc(json.dumps(item.get("source_references", []), ensure_ascii=False, indent=2)))
+        for item in snapshot.get("cross_method_correlations", {}).get("links", [])) or "<p>No source regions met the deterministic cross-method overlap rule.</p>"
     timeline = "".join("<li><b>{}</b> {} · {} · confidence {} {}</li>".format(
         _esc(item.get("raw_date")), "(ambiguous date)" if item.get("ambiguous") else "", _esc(item.get("description")),
         _esc(item.get("confidence")), _refs(item.get("evidence_refs", []))) for item in snapshot.get("timeline", []))
@@ -162,6 +222,16 @@ def render_html(snapshot: dict) -> str:
     narrative = snapshot.get("ai_narrative") or {}
     narrative_html = "<p>{}</p><p>Model: {} · status: {}</p><ul>{}</ul>".format(_esc(narrative.get("text") or "No model narrative was stored."),
         _esc(narrative.get("model") or "not used"), _esc(narrative.get("status")), _refs(narrative.get("evidence_refs", [])))
+    findings_diagnostics = snapshot.get("findings_diagnostics") or {"status": "not_recorded"}
+    processing_diagnostics = "".join(
+        "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            _esc(item.get("filename")), _esc(item.get("document_id")), _esc(item.get("processing_status")),
+            _esc(item.get("relationship_extraction_status")), _esc(item.get("error_code") or "none"),
+            _esc(item.get("retryable") if item.get("retryable") is not None else "n/a"),
+            _esc(item.get("error") or "none recorded"),
+            _esc("; ".join(f"run {run.get('run_number')}: {run.get('status')} · {run.get('duration_ms')} ms" for run in item.get("extraction_runs", [])) or "no extraction runs"),
+        ) for item in snapshot.get("document_processing_diagnostics", [])
+    ) or '<tr><td colspan="8">No document processing records were stored.</td></tr>'
     lists = lambda items: "".join(f"<li>{_esc(value)}</li>" for value in items) or "<li>None recorded.</li>"
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Investigation dossier · {_esc(inv.get("case_number"))}</title>
@@ -173,9 +243,13 @@ def render_html(snapshot: dict) -> str:
 <main><h2>Executive summary</h2><p>{_esc(inv.get("description") or "No investigation scope description is recorded.")}</p><p>This report contains {len(docs)} persisted document(s), {len(snapshot.get("findings", []))} candidate/reviewed finding(s), {len(snapshot.get("cross_document_links", []))} cross-document link(s), and {len(snapshot.get("timeline", []))} timeline event(s). Findings remain candidates unless an investigator decision is recorded.</p>{narrative_html}
 <h2>Scope and methodology</h2><p>Investigation status: <b>{_esc(inv.get("status"))}</b>. The dossier was assembled from records persisted at generation time and is immutable as a versioned snapshot.</p><ul>{lists(snapshot.get("methodology", []))}</ul>
 <h2>Document inventory and chain of custody</h2><table><thead><tr><th>File</th><th>Document ID</th><th>SHA-256</th><th>Processing status</th><th>Bytes</th><th>Uploaded at</th></tr></thead><tbody>{inventory}</tbody></table>
+<h2>Stage status and processing timings</h2><table><thead><tr><th>File</th><th>Document ID</th><th>OCR status</th><th>Relationship stage</th><th>Error code</th><th>Retryable</th><th>Error detail</th><th>OCR runs and durations</th></tr></thead><tbody>{processing_diagnostics}</tbody></table>
 <h2>OCR-extracted data and source traceability</h2>{''.join(extracted) or '<p>No OCR text is available.</p>'}
 <h2>Cross-document verification</h2>{''.join(correlations) or '<p>No cross-document identifier links were found.</p>'}{''.join(discrepancies) or '<p>No supported cross-document discrepancies were found.</p>'}
 <h2>Evidence-backed findings and analyst disposition</h2>{''.join(findings) or '<p>No findings are stored for this investigation.</p>'}
+<h2>Evidence rule diagnostics</h2><p>Rule statuses distinguish matches, non-matches, missing inputs, inapplicable rules, and processing errors. Skipped checks are not counted as successful comparisons.</p><pre>{_esc(json.dumps(findings_diagnostics, ensure_ascii=False, indent=2))}</pre>
+<h2>PDF structural analysis</h2><p>Status: <span class="badge">{_esc(snapshot.get("pdf_structural_analysis", {}).get("status", "not_run"))}</span>. Parser facts are descriptive and do not establish manipulation.</p>{pdf_runs or '<p>No PDF structural analysis runs were recorded.</p>'}<ul>{lists(snapshot.get("pdf_structural_analysis", {}).get("limitations", []))}</ul>
+<h2>Cross-method evidence links</h2><p>Geometric links are navigation aids and do not establish manipulation.</p>{cross_method_html}
 <h2>Visual-forensics results</h2><p>Status: <span class="badge">{_esc(snapshot.get("visual_analysis", {}).get("status"))}</span>. {_esc(snapshot.get("visual_analysis", {}).get("methodology"))}</p>{visual_runs or '<p>No visual analysis runs were recorded.</p>'}<table><thead><tr><th>Method</th><th>Implementation</th><th>Status</th><th>Measurements</th><th>Candidate observations and source references</th><th>Diagnostics</th><th>Limitations</th></tr></thead><tbody>{visual_checks or '<tr><td colspan="7">No visual checks were recorded.</td></tr>'}</tbody></table><ul>{lists(snapshot.get("visual_analysis", {}).get("limitations", []))}</ul>
 <h2>Relationship analysis</h2>{''.join(graph) or '<p>No investigation relationship graph nodes are stored.</p>'}{''.join(relationships) or '<p>No per-document relationship extraction payloads are stored.</p>'}
 <h2>Investigation timeline</h2><ul>{timeline or '<li>No timeline events are stored.</li>'}</ul>
@@ -249,18 +323,35 @@ def render_pdf(snapshot: dict) -> bytes:
     for item in snapshot.get("methodology", []): story.append(para("• " + item))
     section("Document inventory and chain of custody")
     table([["File", "Document ID", "SHA-256", "Status", "Bytes", "Uploaded"]] + [[d.get("filename", ""), d.get("id", ""), d.get("sha256") or "N/A", d.get("processing_status", ""), str(d.get("size_bytes", "")), d.get("uploaded_at", "")] for d in snapshot.get("evidence_inventory", [])], [35 * mm, 32 * mm, 37 * mm, 22 * mm, 15 * mm, 29 * mm])
+    section("Stage status and processing timings")
+    table([["File", "OCR stage", "Relationship stage", "Error code", "Retryable", "Error detail", "OCR/relationship attempts", "Extraction runs"]] + [[
+        item.get("filename", ""), item.get("processing_status", ""), item.get("relationship_extraction_status", "not_run"),
+        item.get("error_code") or "none", str(item.get("retryable") if item.get("retryable") is not None else "n/a"),
+        item.get("error") or "none recorded",
+        f"{item.get('ocr_attempts', 0)}/{item.get('relationship_attempts', 0)}",
+        "; ".join(f"run {run.get('run_number')}: {run.get('status')} · {run.get('duration_ms')} ms" for run in item.get("extraction_runs", [])) or "none recorded",
+    ] for item in snapshot.get("document_processing_diagnostics", [])], [22 * mm, 18 * mm, 22 * mm, 19 * mm, 12 * mm, 31 * mm, 18 * mm, 28 * mm])
     section("OCR-extracted data and source traceability")
     for item in snapshot.get("extracted_information", []):
-        story.extend([para(item.get("filename", "Unknown document"), "Heading3"), para(f"Document ID: {item.get('document_id', '')}", "Small"), para(item.get("text", "") or "No OCR text.", "Small")])
-        blocks = [["Page", "Block", "Confidence", "Coordinates", "OCR text"]]
+        coverage = item.get("coverage") or {}
+        coverage_summary = " · ".join(
+            f"{label}: {coverage.get(key)}" for key, label in (
+                ("page_count", "Pages"), ("ocr_blocks", "OCR blocks"),
+                ("native_pdf_blocks", "Native PDF blocks"),
+                ("pages_with_ocr_text", "Pages with OCR"),
+                ("pages_with_native_text", "Pages with native text"),
+            ) if coverage.get(key) is not None
+        ) or "not recorded"
+        story.extend([para(item.get("filename", "Unknown document"), "Heading3"), para(f"Document ID: {item.get('document_id', '')}", "Small"), para(f"Extraction coverage: {coverage_summary}", "Small"), para(f"Relationship stage: {item.get('relationship_extraction_status', 'not_run')} · structured fields and table rows follow", "Small"), para(json.dumps({"structured_fields": item.get("structured_fields", []), "table_rows": item.get("table_rows", [])}, ensure_ascii=False), "Small"), para(item.get("text", "") or "No extracted text.", "Small")])
+        blocks = [["Page", "Block", "Method", "Confidence", "Coordinates", "Source text"]]
         for block in item.get("blocks", []):
             original_text = str(block.get("text", ""))
             parts = [original_text[start:start + 300] for start in range(0, len(original_text), 300)] or [""]
             for part_index, part in enumerate(parts, start=1):
                 page = str(block.get("page_index", 0) + 1) if isinstance(block.get("page_index", 0), int) else "unknown"
                 block_id = str(block.get("block_id", "")) + (f" · part {part_index}/{len(parts)}" if len(parts) > 1 else "")
-                blocks.append([page, block_id, str(block.get("engine_confidence", "N/A")), str(block.get("engine_bbox", block.get("bounding_box", "N/A"))), part])
-        if len(blocks) > 1: table(blocks, [13 * mm, 25 * mm, 21 * mm, 30 * mm, 81 * mm])
+                blocks.append([page, block_id, str(block.get("extraction_method", "ocr")), str(block.get("engine_confidence", "N/A")), str(block.get("engine_bbox", block.get("bounding_box", "N/A"))), part])
+        if len(blocks) > 1: table(blocks, [11 * mm, 22 * mm, 22 * mm, 18 * mm, 26 * mm, 71 * mm])
     section("Cross-document verification")
     for link in snapshot.get("cross_document_links", []):
         story.append(para(f"{link.get('identifier_type')}: {link.get('normalized_identifier')} · {link.get('review_status')} · {link.get('method')}" , "Heading3")); story.append(para(link.get("explanation", "")))
@@ -275,6 +366,31 @@ def render_pdf(snapshot: dict) -> bytes:
         for ref in item.get("evidence_refs", []): story.append(para(f"Source {ref.get('filename') or ref.get('document_id')} · page {ref.get('page_number')} · block {ref.get('block_id')} · coordinates {ref.get('bounding_box', 'not recorded')}: {ref.get('quoted_text')}", "Small"))
         story.append(Spacer(1, 5))
     if not snapshot.get("findings"): story.append(para("No findings are stored for this investigation."))
+    section("Evidence rule diagnostics", "Rule statuses distinguish matches, non-matches, missing inputs, inapplicable rules, and processing errors. Skipped checks are not successful comparisons.")
+    story.append(para(json.dumps(snapshot.get("findings_diagnostics") or {"status": "not_recorded"}, ensure_ascii=False), "Small"))
+    pdf_forensics = snapshot.get("pdf_structural_analysis", {})
+    section("PDF structural analysis", f"Status: {pdf_forensics.get('status', 'not_run')}. Parser facts are descriptive; they do not establish alteration, intent, or authenticity.")
+    if not pdf_forensics.get("runs"):
+        story.append(para("No PDF structural analysis runs were recorded."))
+    for run in pdf_forensics.get("runs", []):
+        facts = (run.get("result") or {}).get("document", {})
+        story.extend([
+            para(f"Run {run.get('id')} · document {run.get('document_id')} · source SHA-256 {run.get('source_sha256')}", "Heading3"),
+            para(f"Status: {run.get('status')} · parser {(run.get('parser') or {}).get('name')} {(run.get('parser') or {}).get('version')} · pages {facts.get('page_count', 'unavailable')} · parser-reported revisions {facts.get('revision_count', 'unavailable')} · xref entries {facts.get('xref_entry_count', 'unavailable')}", "Small"),
+            para(f"Embedded images: {len(facts.get('embedded_images', []))} · detected signature objects: {len(facts.get('signature_objects', []))} · cryptographic signature verification: {(run.get('result') or {}).get('signature_verification', {}).get('status', 'unavailable')} · embedded files: {facts.get('embedded_file_count', 'unavailable')} · JavaScript name references: {facts.get('javascript_reference_count', 'unavailable')}", "Small"),
+            para(f"Metadata: {json.dumps(facts.get('metadata', {}), ensure_ascii=False)}", "Small"),
+            para(f"Object types: {json.dumps((run.get('result') or {}).get('objects', {}).get('type_counts', {}), ensure_ascii=False)}", "Small"),
+        ])
+        for limitation in (run.get("result") or {}).get("limitations", []):
+            story.append(para("Limitation: " + limitation, "Small"))
+    for limitation in pdf_forensics.get("limitations", []):
+        story.append(para("Scope: " + limitation, "Small"))
+    cross_method = snapshot.get("cross_method_correlations", {})
+    section("Cross-method evidence links", "Deterministic same-page geometry overlaps between text/OCR discrepancies and visual observations. Links are for source navigation and review, not authenticity judgments.")
+    if not cross_method.get("links"):
+        story.append(para("No source regions met the deterministic cross-method overlap rule."))
+    for link in cross_method.get("links", []):
+        story.extend([para(f"Page {link.get('page_number')} · methods {', '.join(link.get('methods', []))} · overlap {link.get('overlap_ratio')}", "Heading3"), para(link.get("interpretation", ""), "Small"), para(json.dumps(link.get("source_references", []), ensure_ascii=False), "Small")])
     visual = snapshot.get("visual_analysis", {})
     section("Visual-forensics results", f"Status: {visual.get('status')}. {visual.get('methodology', 'No visual method documentation was stored.')}")
     for run in visual.get("runs", []):

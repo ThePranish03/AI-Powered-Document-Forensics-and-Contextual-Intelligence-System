@@ -12,10 +12,12 @@ from app.api.v1 import auth as auth_routes
 from app.api.v1 import investigations as investigation_routes
 from app.core.config import settings
 from app.main import app
-from app.models.entities import DossierSnapshot, Document, OCRResult
+from app.models.entities import DerivedGraphNode, DossierSnapshot, Document, OCRResult, User
 from app.services import investigation_analysis as investigation_analysis_service
+from app.services import ocr_worker
 from app.services.audit_chain import event_hash, verify_audit_chain
 from app.services.ocr_metrics import analyze_documents, build_cross_document_correlation, character_error_rate, detection_scores, evaluate_samples, extract_document_facts, word_error_rate
+from app.services.relationship_index import _candidate_key
 
 
 PASSWORD = "StrongPassword123"
@@ -314,6 +316,12 @@ async def test_analysis_review_dossier_and_evaluation(client, monkeypatch, tmp_p
             ))
         await session.commit()
 
+    # API correlation reads the worker's persisted index and compact facts; it
+    # must not reconstruct them by scanning OCR blocks on each GET.
+    monkeypatch.setattr(ocr_worker, "SessionLocal", app.state.test_sessions)
+    for document_id in texts:
+        await ocr_worker._persist_deterministic_evidence(UUID(document_id))
+
     run = await client.post(f"/api/v1/investigations/{case_id}/analysis-runs", headers=headers)
     assert run.status_code == 201
     assert run.json()["candidate_findings_written"] >= 2
@@ -370,8 +378,16 @@ async def test_analysis_review_dossier_and_evaluation(client, monkeypatch, tmp_p
     assert correlation["summary"]["documents_with_ocr"] == 2
     assert correlation["summary"]["candidate_links"] == 1
     assert correlation["summary"]["contradictions"] == 1
-    assert {ref["document_id"] for ref in correlation["links"][0]["evidence_refs"]} == set(texts)
-    candidate_id = correlation["links"][0]["id"]
+    assert len(correlation["links"]) == 1
+    expected_candidate_key = _candidate_key(UUID(case_id), "INVOICE", "INV-10001")
+    indexed_link = correlation["links"][0]
+    assert indexed_link["candidate_key"] == expected_candidate_key
+    assert indexed_link["id"] == "detrel:" + expected_candidate_key[:24]
+    assert indexed_link["document_ids"] == sorted(texts)
+    assert {ref["document_id"] for ref in indexed_link["evidence_refs"]} == set(texts)
+    assert indexed_link["lifecycle_status"] == "active"
+    assert indexed_link["review_status"] == "candidate"
+    candidate_id = indexed_link["id"]
     reviewed = await client.patch(
         f"/api/v1/investigations/{case_id}/correlation/{candidate_id}/review",
         headers=headers,
@@ -379,18 +395,57 @@ async def test_analysis_review_dossier_and_evaluation(client, monkeypatch, tmp_p
     )
     assert reviewed.status_code == 200
     assert reviewed.json()["review_status"] == "confirmed"
+    # A contradictory old graph decision must remain visible as ambiguous and
+    # must never replace the indexed candidate's explicit review decision.
+    async with app.state.test_sessions() as session:
+        reviewer = await session.scalar(select(User).where(User.email == "analysis@example.com"))
+        session.add(DerivedGraphNode(
+            investigation_id=UUID(case_id), canonical_id="det:identifier:invoice:INV-10001:conflict",
+            label="INV-10001", entity_type="INVOICE", document_ids=list(texts),
+            resolution="identifier_match", basis="Synthetic conflicting legacy review",
+            review_status="rejected", reviewed_by_user_id=reviewer.id,
+            reviewed_at=datetime(2026, 2, 1, tzinfo=timezone.utc), review_reason="Synthetic conflicting decision",
+        ))
+        await session.commit()
     rerun = await client.post(f"/api/v1/investigations/{case_id}/correlation-runs", headers=headers)
     assert rerun.status_code == 201
     assert len(rerun.json()["links"]) == 1
     after_rerun = (await client.get(f"/api/v1/investigations/{case_id}/correlation")).json()
     assert after_rerun["summary"]["confirmed_links"] == 1
     assert after_rerun["summary"]["unreviewed_links"] == 0
+    assert after_rerun["summary"]["ambiguous_review_links"] == 1
     assert after_rerun["links"][0]["review_reason"] == "Verified the cited source fields."
+    assert after_rerun["links"][0]["review_status"] == "confirmed"
+    assert after_rerun["links"][0]["indexed_review_status"] == "confirmed"
+    assert after_rerun["links"][0]["review_mapping"]["status"] == "ambiguous"
+    assert after_rerun["links"][0]["review_mapping"]["decisions"] == ["confirmed", "rejected"]
+    assert after_rerun["links"][0]["review_history"][-1]["status"] == "confirmed"
+    assert after_rerun["links"][0]["review_history"][-1]["reason"] == "Verified the cited source fields."
+
+    graph = (await client.get(f"/api/v1/investigations/{case_id}/relationships/graph")).json()
+    indexed_graph_node = next(node for node in graph["graph_nodes"] if node["id"] == candidate_id)
+    assert indexed_graph_node["status"] == "confirmed"
+    assert indexed_graph_node["metadata"]["review_mapping"]["status"] == "ambiguous"
+    assert indexed_graph_node["metadata"]["review_history_status"] == "indexed_history_with_legacy_gap"
 
     dossier = await client.post(f"/api/v1/investigations/{case_id}/dossiers", headers=headers)
     assert dossier.status_code == 201
     assert "INV-10001" in dossier.json()["html"]
-    assert dossier.json()["snapshot"]["cross_document_links"][0]["review_status"] == "confirmed"
+    dossier_links = dossier.json()["snapshot"]["cross_document_links"]
+    assert len(dossier_links) == 1
+    dossier_link = dossier_links[0]
+    assert dossier_link["id"] == "detrel:" + expected_candidate_key[:24]
+    assert dossier_link["candidate_key"] == expected_candidate_key
+    assert dossier_link["document_ids"] == sorted(texts)
+    assert dossier_link["lifecycle_status"] == "active"
+    assert dossier_link["review_status"] == "confirmed"
+    assert dossier_link["review_mapping"]["status"] == "ambiguous"
+    assert dossier_link["review_history_status"] == "indexed_history_with_legacy_gap"
+    assert dossier_link["review_reason"] == "Verified the cited source fields."
+    assert dossier_link["reviewed_at"]
+    assert dossier_link["reviewed_by_user_id"]
+    assert dossier_link["review_history"][-1]["status"] == "confirmed"
+    assert dossier_link["review_history"][-1]["reason"] == "Verified the cited source fields."
     assert "invoice-a.png" in dossier.json()["html"]
     assert len(dossier.json()["snapshot"]["cross_document_discrepancies"]) == 1
     assert dossier.json()["snapshot"]["extracted_information"]
